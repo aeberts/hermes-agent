@@ -1260,6 +1260,11 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    id              INTEGER,
+    subscriber_kind TEXT,
+    target          TEXT,
+    scope           TEXT DEFAULT 'task',
+    delivery_policy TEXT DEFAULT 'channel',
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2026,6 +2031,31 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        # Surface-agnostic subscription columns (event-hub F01). Additive:
+        # gateway rows keep platform/chat_id/thread_id as their canonical
+        # identity; ``target`` is a denormalized JSON mirror so non-gateway
+        # subscriber kinds have a home. ``id`` is a surrogate key backfilled
+        # below. ``scope``/``delivery_policy`` carry defaults for fresh rows
+        # and stay NULL on legacy rows until backfilled.
+        if "id" not in notify_cols:
+            _add_column_if_missing(conn, "kanban_notify_subs", "id", "id INTEGER")
+        if "subscriber_kind" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "subscriber_kind", "subscriber_kind TEXT"
+            )
+        if "target" not in notify_cols:
+            _add_column_if_missing(conn, "kanban_notify_subs", "target", "target TEXT")
+        if "scope" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "scope", "scope TEXT DEFAULT 'task'"
+            )
+        if "delivery_policy" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivery_policy",
+                "delivery_policy TEXT DEFAULT 'channel'",
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2099,6 +2129,57 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    # Surface-agnostic subscription backfill (event-hub F01). Runs after the
+    # rebuild pass so a drifted legacy table has already been recreated. The
+    # unique id index is created here (not in SCHEMA_SQL) for the same reason
+    # the additive tasks indexes are: SQLite parses SCHEMA_SQL against the live
+    # schema, so an index over the additive ``id`` column would abort init on a
+    # legacy board before the ALTER TABLE migration runs.
+    if notify_table_exists or conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone() is not None:
+        _backfill_notify_subs(conn)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_id "
+            "ON kanban_notify_subs(id)"
+        )
+
+
+def _backfill_notify_subs(conn: sqlite3.Connection) -> None:
+    """Backfill surface-agnostic columns on existing ``kanban_notify_subs`` rows.
+
+    Existing rows predate the generalized schema (event-hub F01): they have a
+    NULL ``id``/``subscriber_kind``/``target``. Assign each a unique ``id``
+    (the row's implicit ``rowid``), mark it ``subscriber_kind='gateway'``, and
+    populate ``target`` with the JSON mirror of its gateway identity so
+    non-gateway kinds can share one column. Idempotent: rows already carrying
+    an ``id`` are skipped, so re-running is a no-op.
+    """
+    rows = conn.execute(
+        "SELECT rowid, task_id, platform, chat_id, thread_id, user_id "
+        "FROM kanban_notify_subs WHERE id IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    with write_txn(conn):
+        for row in rows:
+            target = json.dumps(
+                {
+                    "platform": row["platform"],
+                    "chat_id": row["chat_id"],
+                    "thread_id": row["thread_id"],
+                    "user_id": row["user_id"],
+                }
+            )
+            conn.execute(
+                "UPDATE kanban_notify_subs "
+                "SET id = ?, subscriber_kind = 'gateway', target = ?, "
+                "    scope = COALESCE(scope, 'task'), "
+                "    delivery_policy = COALESCE(delivery_policy, 'channel') "
+                "WHERE rowid = ?",
+                (row["rowid"], target, row["rowid"]),
+            )
+
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
 # ``kanban_notify_subs``, a nullable ``TEXT last_event_id``). The current
@@ -2151,6 +2232,8 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " id INTEGER, subscriber_kind TEXT, target TEXT,"
+        " scope TEXT DEFAULT 'task', delivery_policy TEXT DEFAULT 'channel',"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -8246,14 +8329,34 @@ def add_notify_sub(
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
     now = int(time.time())
+    target = json.dumps(
+        {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id or "",
+            "user_id": user_id,
+        }
+    )
     with write_txn(conn):
+        # Assign a surrogate ``id`` (event-hub F01) inline. INSERT OR IGNORE on
+        # an existing (task, platform, chat, thread) leaves the prior row's id
+        # untouched; ``scope``/``delivery_policy`` take their column defaults.
+        next_id = (
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM kanban_notify_subs"
+            ).fetchone()[0]
+        )
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile,
+                 created_at, id, subscriber_kind, target)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'gateway', ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id, platform, chat_id, thread_id or "", user_id,
+                notifier_profile, now, next_id, target,
+            ),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
