@@ -740,6 +740,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
 
+    p_notices = sub.add_parser(
+        "notices",
+        help="Drain pending CLI terminal-event notices (subscriber-kind=cli). "
+             "Reading clears them (notice-first display).",
+    )
+    p_notices.add_argument(
+        "--target-id", default=None,
+        help="Only drain notices for this CLI target id (default: all targets)",
+    )
+    p_notices.add_argument("--json", action="store_true")
+
     # --- log ---
     p_log = sub.add_parser(
         "log",
@@ -988,6 +999,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-subscribe":   _cmd_notify_subscribe,
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
+            "notices":            _cmd_notices,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
@@ -2523,6 +2535,27 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
         print("(no such subscription)", file=sys.stderr)
         return 1
     print(f"Unsubscribed from {args.task_id}")
+    return 0
+
+
+def _cmd_notices(args: argparse.Namespace) -> int:
+    """Drain pending CLI terminal-event notices (event-hub F05).
+
+    The notifier persists a notice per claimed terminal event for any
+    ``subscriber_kind='cli'`` subscription. Reading is a one-shot drain so each
+    notice surfaces exactly once.
+    """
+    target_id = getattr(args, "target_id", None)
+    with kb.connect_closing() as conn:
+        notices = kb.drain_cli_notices(conn, target_id=target_id)
+    if getattr(args, "json", False):
+        print(json.dumps(notices, indent=2, ensure_ascii=False))
+        return 0
+    if not notices:
+        print("(no notices)")
+        return 0
+    for n in notices:
+        print(n["message"])
     return 0
 
 

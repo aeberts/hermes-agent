@@ -831,11 +831,11 @@ def test_notify_list_surfaces_subscriber_kind_and_target(kanban_home):
     assert "sess-1" in out
 
 
-def test_get_delivery_adapter_cli_still_none(kanban_home):
-    """F04 persists explicit subscriptions only; it must NOT register a CLI
-    delivery adapter (that is F05). get_delivery_adapter('cli') stays None."""
-    from gateway.kanban_delivery import get_delivery_adapter
-    assert get_delivery_adapter("cli") is None
+def test_get_delivery_adapter_cli_registered(kanban_home):
+    """F05 registers the CLI delivery adapter for subscriber_kind='cli'.
+    (F04 left this None; F05 is what wires it.)"""
+    from gateway.kanban_delivery import CLIDeliveryAdapter, get_delivery_adapter
+    assert isinstance(get_delivery_adapter("cli"), CLIDeliveryAdapter)
     # gateway adapter still present.
     assert get_delivery_adapter("gateway") is not None
     assert get_delivery_adapter(None) is not None

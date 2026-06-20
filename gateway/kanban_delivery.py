@@ -19,6 +19,7 @@ interface.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -156,12 +157,139 @@ class GatewayDeliveryAdapter:
         return DeliveryResult(ok=True)
 
 
-# Registry keyed by ``subscriber_kind``. Production ships exactly one adapter
-# (``gateway``); F05/F06 register CLI/TUI adapters here without touching the
-# watcher's dispatch logic. Legacy rows have NULL ``subscriber_kind`` — the
-# watcher normalizes that to ``'gateway'`` before lookup.
-DELIVERY_ADAPTERS: dict[str, GatewayDeliveryAdapter] = {
+def _format_cli_notice(sub: dict, task, ev) -> Optional[str]:
+    """Render one terminal event as a plain-text CLI notice line.
+
+    Mirrors the gateway adapter's per-kind phrasing (minus emoji/metadata) so a
+    CLI subscriber reads the same handoff the gateway would have pushed. Returns
+    ``None`` for non-terminal kinds so the caller skips them.
+    """
+    kind = ev.kind
+    title = (task.title if task else sub["task_id"])[:120]
+    who = (task.assignee if task and task.assignee else None)
+    tag = f"@{who} " if who else ""
+    if kind == "completed":
+        handoff = ""
+        payload_summary = None
+        if ev.payload and ev.payload.get("summary"):
+            payload_summary = str(ev.payload["summary"])
+        if payload_summary:
+            lines = payload_summary.strip().splitlines()
+            h = lines[0][:200] if lines else payload_summary[:200]
+            handoff = f"\n{h}"
+        elif task and task.result:
+            lines = task.result.strip().splitlines()
+            r = lines[0][:160] if lines else task.result[:160]
+            handoff = f"\n{r}"
+        return f"{tag}Kanban {sub['task_id']} done — {title}{handoff}"
+    if kind == "blocked":
+        reason = ""
+        if ev.payload and ev.payload.get("reason"):
+            reason = f": {str(ev.payload['reason'])[:160]}"
+        return f"{tag}Kanban {sub['task_id']} blocked{reason}"
+    if kind == "gave_up":
+        err = ""
+        if ev.payload and ev.payload.get("error"):
+            err = f"\n{str(ev.payload['error'])[:200]}"
+        return (
+            f"{tag}Kanban {sub['task_id']} gave up "
+            f"after repeated spawn failures{err}"
+        )
+    if kind == "crashed":
+        return (
+            f"{tag}Kanban {sub['task_id']} worker crashed "
+            f"(pid gone); dispatcher will retry"
+        )
+    if kind == "timed_out":
+        limit = 0
+        if ev.payload and ev.payload.get("limit_seconds"):
+            limit = int(ev.payload["limit_seconds"])
+        return (
+            f"{tag}Kanban {sub['task_id']} timed out "
+            f"(max_runtime={limit}s); will retry"
+        )
+    return None
+
+
+def _cli_target_id(sub: dict) -> str:
+    """Resolve the CLI target id for a subscription (event-hub F04 convention).
+
+    F04 persists a cli subscription with ``chat_id=<target-id>`` and a ``target``
+    JSON carrying ``{"subscriber_kind": "cli", "target_id": ...}``. Prefer the
+    structured ``target`` id, fall back to ``chat_id``.
+    """
+    raw = sub.get("target")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            data = None
+        if isinstance(data, dict) and data.get("target_id"):
+            return str(data["target_id"])
+    return str(sub.get("chat_id") or "")
+
+
+class CLIDeliveryAdapter:
+    """Deliver claimed terminal events to a CLI subscriber (``subscriber_kind='cli'``).
+
+    The CLI has no live push channel, so "delivery" persists a plain-text notice
+    to ``kanban_cli_notices`` keyed by the CLI target id; ``hermes kanban
+    notices`` drains it. No gateway, no network, no ``Platform`` adapter — the
+    watcher sets ``delivery['adapter']`` to ``None`` for non-gateway kinds.
+    Dedup is owned by the shared claim cursor: a re-claim returns no events, so
+    no duplicate notice is written.
+    """
+
+    async def deliver(self, runner, delivery: dict) -> DeliveryResult:
+        from hermes_cli import kanban_db as _kb
+
+        sub = delivery["sub"]
+        task = delivery["task"]
+        board_slug = delivery.get("board")
+        target_id = _cli_target_id(sub)
+
+        def _persist() -> None:
+            conn = _kb.connect(board=board_slug)
+            try:
+                for ev in delivery["events"]:
+                    message = _format_cli_notice(sub, task, ev)
+                    if message is None:
+                        continue
+                    _kb.add_cli_notice(
+                        conn,
+                        target_id=target_id,
+                        task_id=sub["task_id"],
+                        kind=ev.kind,
+                        message=message,
+                    )
+            finally:
+                conn.close()
+
+        try:
+            import asyncio
+
+            await asyncio.to_thread(_persist)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: cli notice persist failed for %s: %s",
+                sub.get("task_id"), exc,
+            )
+            return DeliveryResult(ok=False)
+        logger.debug(
+            "kanban notifier: queued cli notice(s) for %s to target %s on board %s",
+            sub["task_id"], target_id, board_slug,
+        )
+        return DeliveryResult(ok=True)
+
+
+# Registry keyed by ``subscriber_kind``. Production ships the ``gateway`` adapter
+# (all current rows) plus the F05 ``cli`` adapter; F06 registers a TUI adapter
+# here without touching the watcher's dispatch logic. Legacy rows have NULL
+# ``subscriber_kind`` — the watcher normalizes that to ``'gateway'`` before
+# lookup.
+DELIVERY_ADAPTERS: dict[str, Any] = {
     "gateway": GatewayDeliveryAdapter(),
+    "cli": CLIDeliveryAdapter(),
 }
 
 

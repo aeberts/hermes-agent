@@ -1278,6 +1278,23 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Notice queue for non-gateway (CLI) subscribers (event-hub F05). The CLI has
+-- no live push channel, so a terminal-event delivery for a ``subscriber_kind=
+-- 'cli'`` subscription persists a plain-text notice here keyed by the CLI
+-- target id. ``hermes kanban notices`` drains it (notice-first display);
+-- dedup is owned by the subscription's claim cursor, so the notifier only
+-- writes a row the first time an event is claimed.
+CREATE TABLE IF NOT EXISTS kanban_cli_notices (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id  TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    message    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cli_notices_target     ON kanban_cli_notices(target_id, id);
 """
 
 
@@ -8665,6 +8682,66 @@ def rewind_notify_cursor(
             (int(old_cursor), resolved, int(claimed_cursor)),
         )
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# CLI notice queue (event-hub F05)
+# ---------------------------------------------------------------------------
+
+def add_cli_notice(
+    conn: sqlite3.Connection,
+    *,
+    target_id: str,
+    task_id: str,
+    kind: str,
+    message: str,
+) -> int:
+    """Persist a terminal-event notice for a ``subscriber_kind='cli'`` target.
+
+    The CLI has no live push channel, so :class:`CLIDeliveryAdapter` records a
+    plain-text notice here instead of sending. ``hermes kanban notices`` drains
+    it. Dedup is owned by the subscription claim cursor — the notifier only
+    delivers (and so only writes) the first time an event is claimed. Returns
+    the new notice's surrogate id.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO kanban_cli_notices "
+            "(target_id, task_id, kind, message, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (target_id, task_id, kind, message, now),
+        )
+    return int(cur.lastrowid)
+
+
+def drain_cli_notices(
+    conn: sqlite3.Connection, *, target_id: Optional[str] = None,
+) -> list[dict]:
+    """Return pending CLI notices (optionally for one target) and delete them.
+
+    Notice-first display: reading is a one-shot drain so a notice surfaces
+    exactly once. Rows are returned oldest-first. ``target_id=None`` drains
+    every target on the board.
+    """
+    with write_txn(conn):
+        if target_id is not None:
+            rows = conn.execute(
+                "SELECT id, target_id, task_id, kind, message, created_at "
+                "FROM kanban_cli_notices WHERE target_id = ? ORDER BY id ASC",
+                (target_id,),
+            ).fetchall()
+            conn.execute(
+                "DELETE FROM kanban_cli_notices WHERE target_id = ?",
+                (target_id,),
+            )
+        else:
+            rows = conn.execute(
+                "SELECT id, target_id, task_id, kind, message, created_at "
+                "FROM kanban_cli_notices ORDER BY id ASC"
+            ).fetchall()
+            conn.execute("DELETE FROM kanban_cli_notices")
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

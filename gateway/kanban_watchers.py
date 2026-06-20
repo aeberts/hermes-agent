@@ -256,8 +256,16 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), owner_profile, notifier_profile,
                                     )
                                     continue
+                                # The "adapter not connected" skip only applies
+                                # to gateway subscriptions, whose ``platform`` is
+                                # a real messaging platform that must have a live
+                                # adapter. Non-gateway kinds (cli/tui) carry the
+                                # kind in ``platform`` and deliver through their
+                                # own registered adapter (no live Platform), so
+                                # they bypass this connected-platform gate.
+                                subscriber_kind = sub.get("subscriber_kind") or "gateway"
                                 platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
+                                if subscriber_kind == "gateway" and platform not in active_platforms:
                                     logger.debug(
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",
@@ -313,29 +321,40 @@ class GatewayKanbanWatchersMixin:
                             subscriber_kind, sub.get("task_id"),
                         )
                         continue
-                    try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        continue
-                    adapter = self.adapters.get(plat)
-                    if adapter is None:
-                        logger.debug(
-                            "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
-                            platform_str, sub["task_id"],
-                        )
-                        await asyncio.to_thread(
-                            self._kanban_rewind,
-                            sub,
-                            d["cursor"],
-                            d.get("old_cursor", 0),
-                            board_slug,
-                        )
-                        continue
+                    # Only gateway subscriptions need a live messaging ``Platform``
+                    # adapter resolved from ``self.adapters`` (and the
+                    # disconnect→rewind safety it carries). Non-gateway kinds
+                    # (cli/tui) deliver through their own registered adapter
+                    # which needs no Platform, so they bypass this resolution
+                    # with ``adapter=None``. ``platform_str`` for a cli sub is
+                    # 'cli', which would otherwise raise ValueError in
+                    # ``_Platform(...)`` and be skipped before reaching its
+                    # adapter.
+                    adapter = None
+                    if subscriber_kind == "gateway":
+                        try:
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            # Unknown platform string; skip and advance cursor so
+                            # we don't replay forever.
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            continue
+                        adapter = self.adapters.get(plat)
+                        if adapter is None:
+                            logger.debug(
+                                "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
+                                platform_str, sub["task_id"],
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
+                            )
+                            continue
                     sub_key = (
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
