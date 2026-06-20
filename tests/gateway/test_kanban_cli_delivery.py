@@ -2,8 +2,9 @@
 
 F05 is the first non-gateway delivery adapter. A ``subscriber_kind='cli'``
 subscription has no live push channel, so the adapter persists each claimed
-terminal event as a plain-text notice in ``kanban_cli_notices``; ``hermes
-kanban notices`` drains it. These tests prove:
+terminal event as a plain-text notice in the shared ``kanban_notices`` store
+(F06 generalized F05's cli-only table); ``hermes kanban notices`` drains it.
+These tests prove:
 
 - subscribe cli → complete a task → exactly one notice is delivered; a second
   claim returns no events so no duplicate notice is written (cursor dedup);
@@ -89,7 +90,7 @@ def _claim_and_deliver(sub: dict) -> DeliveryResult:
 def _drain(target_id: str | None = None) -> list[dict]:
     conn = kb.connect()
     try:
-        return kb.drain_cli_notices(conn, target_id=target_id)
+        return kb.drain_notices(conn, subscriber_kind="cli", target_id=target_id)
     finally:
         conn.close()
 

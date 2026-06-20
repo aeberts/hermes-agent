@@ -157,12 +157,13 @@ class GatewayDeliveryAdapter:
         return DeliveryResult(ok=True)
 
 
-def _format_cli_notice(sub: dict, task, ev) -> Optional[str]:
-    """Render one terminal event as a plain-text CLI notice line.
+def _format_notice(sub: dict, task, ev) -> Optional[str]:
+    """Render one terminal event as a plain-text notice line.
 
     Mirrors the gateway adapter's per-kind phrasing (minus emoji/metadata) so a
-    CLI subscriber reads the same handoff the gateway would have pushed. Returns
-    ``None`` for non-terminal kinds so the caller skips them.
+    non-gateway subscriber (CLI/TUI) reads the same handoff the gateway would
+    have pushed. The phrasing is surface-agnostic, so CLI (F05) and TUI (F06)
+    share it. Returns ``None`` for non-terminal kinds so the caller skips them.
     """
     kind = ev.kind
     title = (task.title if task else sub["task_id"])[:120]
@@ -211,12 +212,13 @@ def _format_cli_notice(sub: dict, task, ev) -> Optional[str]:
     return None
 
 
-def _cli_target_id(sub: dict) -> str:
-    """Resolve the CLI target id for a subscription (event-hub F04 convention).
+def _target_id(sub: dict) -> str:
+    """Resolve the target id for a non-gateway subscription (event-hub F04 convention).
 
-    F04 persists a cli subscription with ``chat_id=<target-id>`` and a ``target``
-    JSON carrying ``{"subscriber_kind": "cli", "target_id": ...}``. Prefer the
-    structured ``target`` id, fall back to ``chat_id``.
+    F04 persists a non-gateway subscription with ``chat_id=<target-id>`` and a
+    ``target`` JSON carrying ``{"subscriber_kind": <kind>, "target_id": ...}``.
+    The convention is the same for cli and tui, so this is surface-agnostic:
+    prefer the structured ``target`` id, fall back to ``chat_id``.
     """
     raw = sub.get("target")
     if raw:
@@ -229,16 +231,20 @@ def _cli_target_id(sub: dict) -> str:
     return str(sub.get("chat_id") or "")
 
 
-class CLIDeliveryAdapter:
-    """Deliver claimed terminal events to a CLI subscriber (``subscriber_kind='cli'``).
+class _NoticeDeliveryAdapter:
+    """Base for non-gateway adapters that persist a notice instead of pushing.
 
-    The CLI has no live push channel, so "delivery" persists a plain-text notice
-    to ``kanban_cli_notices`` keyed by the CLI target id; ``hermes kanban
-    notices`` drains it. No gateway, no network, no ``Platform`` adapter — the
-    watcher sets ``delivery['adapter']`` to ``None`` for non-gateway kinds.
-    Dedup is owned by the shared claim cursor: a re-claim returns no events, so
-    no duplicate notice is written.
+    CLI (F05) and TUI (F06) have no live push channel, so "delivery" persists a
+    plain-text notice to the shared, surface-agnostic ``kanban_notices`` table
+    keyed by ``subscriber_kind`` + target id; ``hermes kanban notices`` drains
+    it. No gateway, no network, no ``Platform`` adapter — the watcher sets
+    ``delivery['adapter']`` to ``None`` for non-gateway kinds. Dedup is owned by
+    the shared claim cursor: a re-claim returns no events, so no duplicate
+    notice is written. Subclasses differ only by ``_kind`` (the literal
+    ``subscriber_kind`` stamped on each notice row).
     """
+
+    _kind: str = ""
 
     async def deliver(self, runner, delivery: dict) -> DeliveryResult:
         from hermes_cli import kanban_db as _kb
@@ -246,17 +252,18 @@ class CLIDeliveryAdapter:
         sub = delivery["sub"]
         task = delivery["task"]
         board_slug = delivery.get("board")
-        target_id = _cli_target_id(sub)
+        target_id = _target_id(sub)
 
         def _persist() -> None:
             conn = _kb.connect(board=board_slug)
             try:
                 for ev in delivery["events"]:
-                    message = _format_cli_notice(sub, task, ev)
+                    message = _format_notice(sub, task, ev)
                     if message is None:
                         continue
-                    _kb.add_cli_notice(
+                    _kb.add_notice(
                         conn,
+                        subscriber_kind=self._kind,
                         target_id=target_id,
                         task_id=sub["task_id"],
                         kind=ev.kind,
@@ -271,25 +278,48 @@ class CLIDeliveryAdapter:
             await asyncio.to_thread(_persist)
         except Exception as exc:
             logger.warning(
-                "kanban notifier: cli notice persist failed for %s: %s",
-                sub.get("task_id"), exc,
+                "kanban notifier: %s notice persist failed for %s: %s",
+                self._kind, sub.get("task_id"), exc,
             )
             return DeliveryResult(ok=False)
         logger.debug(
-            "kanban notifier: queued cli notice(s) for %s to target %s on board %s",
-            sub["task_id"], target_id, board_slug,
+            "kanban notifier: queued %s notice(s) for %s to target %s on board %s",
+            self._kind, sub["task_id"], target_id, board_slug,
         )
         return DeliveryResult(ok=True)
 
 
+class CLIDeliveryAdapter(_NoticeDeliveryAdapter):
+    """Persist claimed terminal events as CLI notices (``subscriber_kind='cli'``)."""
+
+    _kind = "cli"
+
+
+class TUIDeliveryAdapter(_NoticeDeliveryAdapter):
+    """Persist claimed terminal events as TUI notices (``subscriber_kind='tui'``).
+
+    F06's whole proof: this is the *second* non-gateway surface, and it reaches
+    the substrate purely by registering here. RFC §5.3 lists both ``tui`` and
+    ``cli`` as "session notice", so TUI is notice-first exactly like CLI —
+    live-turn wakeup/WS push is deferred to M01. No ``tui_gateway`` push, no
+    event_publisher, no running server; just a durable notice in the shared
+    store. The watcher already routes any non-gateway ``subscriber_kind`` to its
+    registered adapter (F05 generalized the gating), so no watcher change was
+    needed.
+    """
+
+    _kind = "tui"
+
+
 # Registry keyed by ``subscriber_kind``. Production ships the ``gateway`` adapter
-# (all current rows) plus the F05 ``cli`` adapter; F06 registers a TUI adapter
-# here without touching the watcher's dispatch logic. Legacy rows have NULL
-# ``subscriber_kind`` — the watcher normalizes that to ``'gateway'`` before
+# (all current rows) plus the F05 ``cli`` adapter; F06 registers the ``tui``
+# adapter here without touching the watcher's dispatch logic. Legacy rows have
+# NULL ``subscriber_kind`` — the watcher normalizes that to ``'gateway'`` before
 # lookup.
 DELIVERY_ADAPTERS: dict[str, Any] = {
     "gateway": GatewayDeliveryAdapter(),
     "cli": CLIDeliveryAdapter(),
+    "tui": TUIDeliveryAdapter(),
 }
 
 

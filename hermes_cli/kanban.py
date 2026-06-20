@@ -742,12 +742,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_notices = sub.add_parser(
         "notices",
-        help="Drain pending CLI terminal-event notices (subscriber-kind=cli). "
-             "Reading clears them (notice-first display).",
+        help="Drain pending non-gateway terminal-event notices (subscriber-kind "
+             "cli/tui). Reading clears them (notice-first display).",
+    )
+    p_notices.add_argument(
+        "--kind", default=None, choices=["cli", "tui"],
+        help="Only drain notices for this subscriber kind (default: all kinds)",
     )
     p_notices.add_argument(
         "--target-id", default=None,
-        help="Only drain notices for this CLI target id (default: all targets)",
+        help="Only drain notices for this target id (default: all targets)",
     )
     p_notices.add_argument("--json", action="store_true")
 
@@ -2539,15 +2543,20 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
 
 
 def _cmd_notices(args: argparse.Namespace) -> int:
-    """Drain pending CLI terminal-event notices (event-hub F05).
+    """Drain pending non-gateway terminal-event notices (event-hub F05/F06).
 
     The notifier persists a notice per claimed terminal event for any
-    ``subscriber_kind='cli'`` subscription. Reading is a one-shot drain so each
-    notice surfaces exactly once.
+    non-gateway subscription (``subscriber_kind`` cli/tui) into one shared,
+    surface-agnostic store. ``--kind`` / ``--target-id`` scope the drain
+    (default: all). Reading is a one-shot drain so each notice surfaces exactly
+    once.
     """
+    subscriber_kind = getattr(args, "kind", None)
     target_id = getattr(args, "target_id", None)
     with kb.connect_closing() as conn:
-        notices = kb.drain_cli_notices(conn, target_id=target_id)
+        notices = kb.drain_notices(
+            conn, subscriber_kind=subscriber_kind, target_id=target_id,
+        )
     if getattr(args, "json", False):
         print(json.dumps(notices, indent=2, ensure_ascii=False))
         return 0

@@ -1279,22 +1279,25 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 
--- Notice queue for non-gateway (CLI) subscribers (event-hub F05). The CLI has
--- no live push channel, so a terminal-event delivery for a ``subscriber_kind=
--- 'cli'`` subscription persists a plain-text notice here keyed by the CLI
--- target id. ``hermes kanban notices`` drains it (notice-first display);
--- dedup is owned by the subscription's claim cursor, so the notifier only
--- writes a row the first time an event is claimed.
-CREATE TABLE IF NOT EXISTS kanban_cli_notices (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    target_id  TEXT NOT NULL,
-    task_id    TEXT NOT NULL,
-    kind       TEXT NOT NULL,
-    message    TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+-- Notice queue for non-gateway (CLI/TUI) subscribers (event-hub F05/F06). These
+-- surfaces have no live push channel, so a terminal-event delivery for a
+-- non-gateway subscription persists a plain-text notice here keyed by
+-- ``subscriber_kind`` + target id. ``hermes kanban notices`` drains it
+-- (notice-first display); dedup is owned by the subscription's claim cursor, so
+-- the notifier only writes a row the first time an event is claimed. One shared,
+-- surface-agnostic table (not per-surface tables) — F06 added the TUI adapter by
+-- registering against this store, not by reinventing it.
+CREATE TABLE IF NOT EXISTS kanban_notices (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscriber_kind TEXT NOT NULL,
+    target_id       TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_cli_notices_target     ON kanban_cli_notices(target_id, id);
+CREATE INDEX IF NOT EXISTS idx_notices_target         ON kanban_notices(subscriber_kind, target_id, id);
 """
 
 
@@ -8685,62 +8688,68 @@ def rewind_notify_cursor(
 
 
 # ---------------------------------------------------------------------------
-# CLI notice queue (event-hub F05)
+# Non-gateway notice queue (event-hub F05/F06)
 # ---------------------------------------------------------------------------
 
-def add_cli_notice(
+def add_notice(
     conn: sqlite3.Connection,
     *,
+    subscriber_kind: str,
     target_id: str,
     task_id: str,
     kind: str,
     message: str,
 ) -> int:
-    """Persist a terminal-event notice for a ``subscriber_kind='cli'`` target.
+    """Persist a terminal-event notice for a non-gateway subscriber target.
 
-    The CLI has no live push channel, so :class:`CLIDeliveryAdapter` records a
-    plain-text notice here instead of sending. ``hermes kanban notices`` drains
-    it. Dedup is owned by the subscription claim cursor — the notifier only
-    delivers (and so only writes) the first time an event is claimed. Returns
-    the new notice's surrogate id.
+    Surface-agnostic: CLI (F05) and TUI (F06) share this one store, keyed by
+    ``subscriber_kind`` + target id. These surfaces have no live push channel,
+    so the delivery adapter records a plain-text notice here instead of sending;
+    ``hermes kanban notices`` drains it. Dedup is owned by the subscription
+    claim cursor — the notifier only delivers (and so only writes) the first
+    time an event is claimed. Returns the new notice's surrogate id.
     """
     now = int(time.time())
     with write_txn(conn):
         cur = conn.execute(
-            "INSERT INTO kanban_cli_notices "
-            "(target_id, task_id, kind, message, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (target_id, task_id, kind, message, now),
+            "INSERT INTO kanban_notices "
+            "(subscriber_kind, target_id, task_id, kind, message, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (subscriber_kind, target_id, task_id, kind, message, now),
         )
     return int(cur.lastrowid)
 
 
-def drain_cli_notices(
-    conn: sqlite3.Connection, *, target_id: Optional[str] = None,
+def drain_notices(
+    conn: sqlite3.Connection,
+    *,
+    subscriber_kind: Optional[str] = None,
+    target_id: Optional[str] = None,
 ) -> list[dict]:
-    """Return pending CLI notices (optionally for one target) and delete them.
+    """Return pending non-gateway notices and delete them (one-shot drain).
 
     Notice-first display: reading is a one-shot drain so a notice surfaces
-    exactly once. Rows are returned oldest-first. ``target_id=None`` drains
-    every target on the board.
+    exactly once. Rows are returned oldest-first and each returned dict carries
+    its ``subscriber_kind``. ``subscriber_kind`` and/or ``target_id`` filter the
+    drain; ``None`` for either means "all" on that axis, so draining one
+    surface/target never consumes another's notices.
     """
+    where: list[str] = []
+    params: list[object] = []
+    if subscriber_kind is not None:
+        where.append("subscriber_kind = ?")
+        params.append(subscriber_kind)
+    if target_id is not None:
+        where.append("target_id = ?")
+        params.append(target_id)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
     with write_txn(conn):
-        if target_id is not None:
-            rows = conn.execute(
-                "SELECT id, target_id, task_id, kind, message, created_at "
-                "FROM kanban_cli_notices WHERE target_id = ? ORDER BY id ASC",
-                (target_id,),
-            ).fetchall()
-            conn.execute(
-                "DELETE FROM kanban_cli_notices WHERE target_id = ?",
-                (target_id,),
-            )
-        else:
-            rows = conn.execute(
-                "SELECT id, target_id, task_id, kind, message, created_at "
-                "FROM kanban_cli_notices ORDER BY id ASC"
-            ).fetchall()
-            conn.execute("DELETE FROM kanban_cli_notices")
+        rows = conn.execute(
+            "SELECT id, subscriber_kind, target_id, task_id, kind, message, "
+            "created_at FROM kanban_notices" + clause + " ORDER BY id ASC",
+            params,
+        ).fetchall()
+        conn.execute("DELETE FROM kanban_notices" + clause, params)
     return [dict(r) for r in rows]
 
 
