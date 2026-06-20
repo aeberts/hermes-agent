@@ -8353,23 +8353,42 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    subscriber_kind: str = "gateway",
+    target: Optional[str] = None,
 ) -> int:
-    """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread).
+    """Register a source that wants terminal-state notifications for
+    ``task_id``. Idempotent on (task, platform, chat, thread).
 
     Returns the subscription's surrogate ``id`` (event-hub F02) — for a fresh
     insert the newly assigned id, for an existing (task, platform, chat,
     thread) tuple the prior row's id.
+
+    Subscriber identity (event-hub F04):
+
+    - ``subscriber_kind`` defaults to ``'gateway'`` (the messaging path); a
+      caller can declare a non-gateway subscriber (e.g. ``'cli'``) explicitly.
+    - ``target`` is the structured identity JSON. When omitted, the gateway
+      tuple ``{platform, chat_id, thread_id, user_id}`` is built as before —
+      so the gateway path is byte-for-byte unchanged. Non-gateway callers
+      pass an explicit ``target`` describing their delivery destination.
+
+    The PK ``(task_id, platform, chat_id, thread_id)`` and its NOT NULL columns
+    are populated from the args regardless of kind; non-gateway callers use the
+    convention ``platform=subscriber_kind`` + ``chat_id=<target primary id>``
+    (with ``thread_id=''``) so the PK stays satisfied and unique per
+    (task, kind, target-id), while the real structured identity lives in the
+    ``subscriber_kind`` column + ``target`` JSON.
     """
     now = int(time.time())
-    target = json.dumps(
-        {
-            "platform": platform,
-            "chat_id": chat_id,
-            "thread_id": thread_id or "",
-            "user_id": user_id,
-        }
-    )
+    if target is None:
+        target = json.dumps(
+            {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id or "",
+                "user_id": user_id,
+            }
+        )
     with write_txn(conn):
         # Assign a surrogate ``id`` (event-hub F01) inline. INSERT OR IGNORE on
         # an existing (task, platform, chat, thread) leaves the prior row's id
@@ -8384,11 +8403,11 @@ def add_notify_sub(
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, notifier_profile,
                  created_at, id, subscriber_kind, target)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'gateway', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id, platform, chat_id, thread_id or "", user_id,
-                notifier_profile, now, next_id, target,
+                notifier_profile, now, next_id, subscriber_kind, target,
             ),
         )
         if notifier_profile:

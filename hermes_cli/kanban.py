@@ -693,12 +693,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
-        help="Subscribe a gateway source to a task's terminal events "
-             "(used by /kanban subscribe in the gateway adapter)",
+        help="Subscribe a source to a task's terminal events "
+             "(gateway via --platform/--chat-id, or an explicit "
+             "--subscriber-kind + --target-id)",
     )
     p_nsub.add_argument("task_id")
-    p_nsub.add_argument("--platform", required=True)
-    p_nsub.add_argument("--chat-id", required=True)
+    p_nsub.add_argument(
+        "--subscriber-kind", default="gateway",
+        help="Subscriber surface tag (default: gateway). Use a non-gateway "
+             "kind (e.g. cli) with --target-id to declare an explicit target.",
+    )
+    p_nsub.add_argument(
+        "--target-id", default=None,
+        help="Primary id of a non-gateway target (required when "
+             "--subscriber-kind is not gateway)",
+    )
+    p_nsub.add_argument(
+        "--target", default=None,
+        help="Explicit structured target JSON (advanced; defaults to a tag "
+             "built from --subscriber-kind + --target-id for non-gateway subs)",
+    )
+    # Gateway flags: required only for the default gateway path (validated in
+    # the handler so non-gateway subscriptions can omit them).
+    p_nsub.add_argument("--platform", default=None)
+    p_nsub.add_argument("--chat-id", default=None)
     p_nsub.add_argument("--thread-id", default=None)
     p_nsub.add_argument("--user-id", default=None)
     p_nsub.add_argument(
@@ -2432,18 +2450,45 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
+    kind = args.subscriber_kind or "gateway"
+    if kind == "gateway":
+        # Back-compat: the gateway path keys identity off --platform/--chat-id.
+        if not args.platform or not args.chat_id:
+            print("notify-subscribe: --platform and --chat-id are required "
+                  "for gateway subscriptions", file=sys.stderr)
+            return 2
+        platform, chat_id = args.platform, args.chat_id
+        thread_id, target = args.thread_id, args.target
+    else:
+        # Explicit non-gateway subscriber (event-hub F04): declare the target
+        # directly instead of inferring it from the calling session. The PK
+        # columns are filled by convention (platform=kind, chat_id=target-id,
+        # thread_id='') so the schema's NOT NULL PK stays satisfied; the real
+        # identity lives in subscriber_kind + the target JSON.
+        if not args.target_id:
+            print(f"notify-subscribe: --target-id is required for "
+                  f"--subscriber-kind {kind}", file=sys.stderr)
+            return 2
+        platform, chat_id, thread_id = kind, args.target_id, ""
+        target = args.target or json.dumps(
+            {"subscriber_kind": kind, "target_id": args.target_id}
+        )
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
         kb.add_notify_sub(
             conn, task_id=args.task_id,
-            platform=args.platform, chat_id=args.chat_id,
-            thread_id=args.thread_id, user_id=args.user_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
+            subscriber_kind=kind, target=target,
         )
-    print(f"Subscribed {args.platform}:{args.chat_id}"
-          + (f":{args.thread_id}" if args.thread_id else "")
+    # ``platform`` already holds the right label in both branches — the real
+    # gateway platform (telegram/discord/…) for gateway subs, or the kind for
+    # non-gateway subs — so the gateway confirmation message is unchanged.
+    print(f"Subscribed {platform}:{chat_id}"
+          + (f":{thread_id}" if thread_id else "")
           + f" to {args.task_id}")
     return 0
 
@@ -2460,8 +2505,10 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
     for s in subs:
         thr = f":{s['thread_id']}" if s.get("thread_id") else ""
         owner = f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else ""
-        print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}"
-              f"  (since event {s['last_event_id']}){owner}")
+        kind = s.get("subscriber_kind") or "gateway"
+        tgt = f"  target={s['target']}" if s.get("target") else ""
+        print(f"  {s['task_id']:10s}  [{kind}] {s['platform']}:{s['chat_id']}{thr}"
+              f"  (since event {s['last_event_id']}){owner}{tgt}")
     return 0
 
 
