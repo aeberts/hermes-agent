@@ -8316,6 +8316,34 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+def _resolve_notify_sub_id(
+    conn: sqlite3.Connection,
+    *,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> Optional[int]:
+    """Resolve a subscription's surrogate ``id`` (event-hub F02).
+
+    The claim/cursor API keys on ``id``. New callers can pass ``sub_id``
+    directly; legacy gateway callers pass the ``(task_id, platform, chat_id,
+    thread_id)`` tuple and this shim looks up the matching row's ``id``.
+    Returns ``None`` when no row matches.
+    """
+    if sub_id is not None:
+        return int(sub_id)
+    row = conn.execute(
+        "SELECT id FROM kanban_notify_subs "
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+        (task_id, platform, chat_id, thread_id or ""),
+    ).fetchone()
+    if row is None or row["id"] is None:
+        return None
+    return int(row["id"])
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -8325,9 +8353,14 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
-) -> None:
+) -> int:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    Returns the subscription's surrogate ``id`` (event-hub F02) — for a fresh
+    insert the newly assigned id, for an existing (task, platform, chat,
+    thread) tuple the prior row's id.
+    """
     now = int(time.time())
     target = json.dumps(
         {
@@ -8370,6 +8403,16 @@ def add_notify_sub(
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
             )
+    # Re-read the (possibly pre-existing) row's surrogate id so callers can key
+    # the claim/cursor API on it directly (event-hub F02).
+    sub_id = _resolve_notify_sub_id(
+        conn,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    return int(sub_id) if sub_id is not None else 0
 
 
 def list_notify_subs(
@@ -8387,16 +8430,28 @@ def list_notify_subs(
 def remove_notify_sub(
     conn: sqlite3.Connection,
     *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
 ) -> bool:
+    """Delete a subscription by surrogate ``id`` (event-hub F02), resolving
+    the legacy gateway tuple → id when ``sub_id`` is not supplied."""
+    resolved = _resolve_notify_sub_id(
+        conn,
+        sub_id=sub_id,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    if resolved is None:
+        return False
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
-            "AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "DELETE FROM kanban_notify_subs WHERE id = ?",
+            (resolved,),
         )
     return cur.rowcount > 0
 
@@ -8404,25 +8459,40 @@ def remove_notify_sub(
 def unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
+    Keyed on the surrogate ``id`` (event-hub F02); legacy gateway callers
+    pass the ``(task_id, platform, chat_id, thread_id)`` tuple instead, which
+    the resolver shim maps to the same row.
+
     Only events with ``id > last_event_id`` are returned. The subscription's
     cursor is NOT advanced here; call :func:`advance_notify_cursor` after
     the gateway has successfully delivered the notifications.
     """
+    resolved = _resolve_notify_sub_id(
+        conn,
+        sub_id=sub_id,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    if resolved is None:
+        return 0, []
     row = conn.execute(
-        "SELECT last_event_id FROM kanban_notify_subs "
-        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-        (task_id, platform, chat_id, thread_id or ""),
+        "SELECT task_id, last_event_id FROM kanban_notify_subs WHERE id = ?",
+        (resolved,),
     ).fetchone()
     if row is None:
         return 0, []
+    task_id = row["task_id"]
     cursor = int(row["last_event_id"])
     kind_list = list(kinds) if kinds else None
     q = (
@@ -8453,18 +8523,24 @@ def unseen_events_for_sub(
 def claim_unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
+    Keyed on the surrogate ``id`` (event-hub F02); legacy gateway callers
+    pass the ``(task_id, platform, chat_id, thread_id)`` tuple, resolved to
+    the same row by the shim.
+
     Returns ``(old_cursor, new_cursor, events)``. When events are returned,
     ``kanban_notify_subs.last_event_id`` has already been advanced to
-    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. That makes the
-    notifier's read/claim step single-owner across multiple gateway watcher
+    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. The cursor-CAS
+    (``AND last_event_id = <old>``) targets a single row by ``id``, so the
+    notifier's read/claim step is single-owner across multiple gateway watcher
     processes pointed at the same board DB: concurrent watchers serialize on
     SQLite's writer lock, and only the first process sees and claims a given
     event range.
@@ -8474,29 +8550,34 @@ def claim_unseen_events_for_sub(
     failed before any terminal unsubscribe removed the row.
     """
     with write_txn(conn):
+        resolved = _resolve_notify_sub_id(
+            conn,
+            sub_id=sub_id,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if resolved is None:
+            return 0, 0, []
         row = conn.execute(
-            "SELECT last_event_id FROM kanban_notify_subs "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "SELECT last_event_id FROM kanban_notify_subs WHERE id = ?",
+            (resolved,),
         ).fetchone()
         if row is None:
             return 0, 0, []
         old_cursor = int(row["last_event_id"])
         new_cursor, events = unseen_events_for_sub(
             conn,
-            task_id=task_id,
-            platform=platform,
-            chat_id=chat_id,
-            thread_id=thread_id,
+            sub_id=resolved,
             kinds=kinds,
         )
         if not events:
             return old_cursor, old_cursor, []
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            "WHERE id = ? AND last_event_id = ?",
+            (int(new_cursor), resolved, int(old_cursor)),
         )
         return old_cursor, new_cursor, events
 
@@ -8504,45 +8585,65 @@ def claim_unseen_events_for_sub(
 def advance_notify_cursor(
     conn: sqlite3.Connection,
     *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
+    """Advance a subscription's cursor, keyed on ``id`` (event-hub F02) with a
+    legacy gateway-tuple shim."""
     with write_txn(conn):
+        resolved = _resolve_notify_sub_id(
+            conn,
+            sub_id=sub_id,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if resolved is None:
+            return
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+            "UPDATE kanban_notify_subs SET last_event_id = ? WHERE id = ?",
+            (int(new_cursor), resolved),
         )
 
 
 def rewind_notify_cursor(
     conn: sqlite3.Connection,
     *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
-    The CAS guard only rewinds if no later notifier advanced the row after our
-    claim. This keeps retry behavior for transient send failures without
-    clobbering newer progress.
+    Keyed on ``id`` (event-hub F02) with a legacy gateway-tuple shim. The CAS
+    guard only rewinds if no later notifier advanced the row after our claim.
+    This keeps retry behavior for transient send failures without clobbering
+    newer progress.
     """
     with write_txn(conn):
+        resolved = _resolve_notify_sub_id(
+            conn,
+            sub_id=sub_id,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if resolved is None:
+            return False
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (
-                int(old_cursor), task_id, platform, chat_id, thread_id or "",
-                int(claimed_cursor),
-            ),
+            "WHERE id = ? AND last_event_id = ?",
+            (int(old_cursor), resolved, int(claimed_cursor)),
         )
     return cur.rowcount > 0
 
