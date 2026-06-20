@@ -1294,6 +1294,7 @@ CREATE TABLE IF NOT EXISTS kanban_notices (
     task_id         TEXT NOT NULL,
     kind            TEXT NOT NULL,
     message         TEXT NOT NULL,
+    payload         TEXT,
     created_at      INTEGER NOT NULL
 );
 
@@ -8375,6 +8376,8 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     subscriber_kind: str = "gateway",
     target: Optional[str] = None,
+    scope: str = "task",
+    delivery_policy: str = "channel",
 ) -> int:
     """Register a source that wants terminal-state notifications for
     ``task_id``. Idempotent on (task, platform, chat, thread).
@@ -8412,7 +8415,10 @@ def add_notify_sub(
     with write_txn(conn):
         # Assign a surrogate ``id`` (event-hub F01) inline. INSERT OR IGNORE on
         # an existing (task, platform, chat, thread) leaves the prior row's id
-        # untouched; ``scope``/``delivery_policy`` take their column defaults.
+        # untouched (and its prior ``scope``/``delivery_policy``). Fresh inserts
+        # take the passed ``scope``/``delivery_policy`` — defaults
+        # (``task``/``channel``) preserve the F04/F05/F06 behavior exactly; F07
+        # passes ``subtree``/``supervise`` for an orchestrator subscription.
         next_id = (
             conn.execute(
                 "SELECT COALESCE(MAX(id), 0) + 1 FROM kanban_notify_subs"
@@ -8422,12 +8428,13 @@ def add_notify_sub(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, notifier_profile,
-                 created_at, id, subscriber_kind, target)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_at, id, subscriber_kind, target, scope, delivery_policy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id, platform, chat_id, thread_id or "", user_id,
                 notifier_profile, now, next_id, subscriber_kind, target,
+                scope, delivery_policy,
             ),
         )
         if notifier_profile:
@@ -8621,6 +8628,137 @@ def claim_unseen_events_for_sub(
         return old_cursor, new_cursor, events
 
 
+ORCHESTRATOR_CLAIM_KINDS: tuple[str, ...] = (
+    "completed", "gave_up", "crashed", "timed_out", "blocked",
+)
+
+
+def claim_unseen_subtree_events_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    kinds: Iterable[str] = ORCHESTRATOR_CLAIM_KINDS,
+) -> tuple[int, int, list[Event]]:
+    """Claim unseen terminal+blocker events across the subscribed root's subtasks.
+
+    The subtree variant of :func:`claim_unseen_events_for_sub` for an
+    orchestrator subscription (event-hub F07, OQ2). Instead of tailing the
+    subscribed *root* task's own events, it observes the root's dependency
+    **parents** in ``task_links`` — which, per :func:`decompose_triage_task`,
+    are exactly its subtasks. Decompose links the root *under* every leaf child
+    (``parent_id = subtask, child_id = root``), so the root is only ever a
+    ``child_id`` and its direct ``task_links`` parents are the subtasks it waits
+    on. It claims those subtasks' unseen events of the given ``kinds`` (terminal
+    + blocker) with ``id > last_event_id`` (transitive-subtree is deferred to
+    F08).
+
+    Dedup uses the exact same cursor-CAS as the single-task claim: the
+    subscription's ``last_event_id`` advances to the max claimed subtask event id
+    inside a ``BEGIN IMMEDIATE`` transaction, guarded by
+    ``AND last_event_id = <old>`` so concurrent claimers serialize on SQLite's
+    writer lock and a re-claim returns nothing.
+
+    Returns ``(old_cursor, new_cursor, events)`` — empty events leave the cursor
+    untouched. A root with zero subtasks returns ``(cursor, cursor, [])``.
+    """
+    kind_list = list(kinds)
+    with write_txn(conn):
+        resolved = _resolve_notify_sub_id(
+            conn,
+            sub_id=sub_id,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        if resolved is None:
+            return 0, 0, []
+        row = conn.execute(
+            "SELECT task_id, last_event_id FROM kanban_notify_subs WHERE id = ?",
+            (resolved,),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        root_id = row["task_id"]
+        old_cursor = int(row["last_event_id"])
+        # The subscribed root's dependency parents ARE its subtasks: decompose
+        # links the root under every child (parent_id = subtask, child_id =
+        # root), so direct parents = all subtasks — no transitive walk needed.
+        # F08 generalizes this to the transitive subtree.
+        subtask_ids = [
+            r["parent_id"]
+            for r in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                (root_id,),
+            ).fetchall()
+        ]
+        if not subtask_ids:
+            return old_cursor, old_cursor, []
+        q = (
+            "SELECT * FROM task_events "
+            "WHERE task_id IN (" + ",".join("?" * len(subtask_ids)) + ") "
+            "AND id > ? "
+            "AND kind IN (" + ",".join("?" * len(kind_list)) + ") "
+            "ORDER BY id ASC"
+        )
+        params: list[Any] = [*subtask_ids, old_cursor, *kind_list]
+        rows = conn.execute(q, params).fetchall()
+        events: list[Event] = []
+        new_cursor = old_cursor
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            events.append(Event(
+                id=r["id"], task_id=r["task_id"], kind=r["kind"],
+                payload=payload, created_at=r["created_at"],
+                run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+            ))
+            new_cursor = max(new_cursor, int(r["id"]))
+        if not events:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE id = ? AND last_event_id = ?",
+            (int(new_cursor), resolved, int(old_cursor)),
+        )
+        return old_cursor, new_cursor, events
+
+
+def subtree_fan_in_ready(conn: sqlite3.Connection, root_id: str) -> bool:
+    """Return True iff every one of the root's parents (subtasks) is terminal.
+
+    Computes fan-in in code (event-hub F07, OQ4). Per
+    :func:`decompose_triage_task` the root is the ``child_id`` and its subtasks
+    are its ``task_links`` parents, so this checks "are all of the root's
+    parents (subtasks) terminal?" — the mirror image of ``recompute_ready``,
+    which promotes the root once those same parents are done. No new
+    ``task_events`` kind is introduced. A root with no parents (nothing fanned
+    out) is **not** fan-in-ready, so the orchestrator never sees a spurious
+    ready signal for a task that never decomposed.
+    """
+    has_parents = conn.execute(
+        "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1",
+        (root_id,),
+    ).fetchone()
+    if not has_parents:
+        return False
+    active = conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks t ON t.id = l.parent_id "
+        "WHERE l.child_id = ? "
+        "AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+        "LIMIT 1",
+        (root_id,),
+    ).fetchone()
+    return active is None
+
+
 def advance_notify_cursor(
     conn: sqlite3.Connection,
     *,
@@ -8699,6 +8837,7 @@ def add_notice(
     task_id: str,
     kind: str,
     message: str,
+    payload: Optional[str] = None,
 ) -> int:
     """Persist a terminal-event notice for a non-gateway subscriber target.
 
@@ -8708,14 +8847,19 @@ def add_notice(
     ``hermes kanban notices`` drains it. Dedup is owned by the subscription
     claim cursor — the notifier only delivers (and so only writes) the first
     time an event is claimed. Returns the new notice's surrogate id.
+
+    ``payload`` (event-hub F07, OQ9) is an optional JSON string carrying a
+    structured continuation snapshot for the orchestrator adapter. cli/tui keep
+    it ``NULL`` and rely on ``message`` alone; the orchestrator adapter sets it
+    to its aggregate-snapshot JSON. The store stays one shared table.
     """
     now = int(time.time())
     with write_txn(conn):
         cur = conn.execute(
             "INSERT INTO kanban_notices "
-            "(subscriber_kind, target_id, task_id, kind, message, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (subscriber_kind, target_id, task_id, kind, message, now),
+            "(subscriber_kind, target_id, task_id, kind, message, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (subscriber_kind, target_id, task_id, kind, message, payload, now),
         )
     return int(cur.lastrowid)
 
@@ -8746,7 +8890,7 @@ def drain_notices(
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, subscriber_kind, target_id, task_id, kind, message, "
-            "created_at FROM kanban_notices" + clause + " ORDER BY id ASC",
+            "payload, created_at FROM kanban_notices" + clause + " ORDER BY id ASC",
             params,
         ).fetchall()
         conn.execute("DELETE FROM kanban_notices" + clause, params)

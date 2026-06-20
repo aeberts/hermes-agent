@@ -289,6 +289,195 @@ class _NoticeDeliveryAdapter:
         return DeliveryResult(ok=True)
 
 
+def _truncate_line(text: Optional[str], limit: int = 200) -> Optional[str]:
+    """First non-empty line of ``text``, truncated to ``limit`` chars.
+
+    Mirrors the size guard ``_format_notice`` already applies (OQ5) so an inline
+    ``summary``/``reason`` in the supervision payload can't balloon a notice row.
+    """
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    line = s.splitlines()[0]
+    return line[:limit]
+
+
+class OrchestratorDeliveryAdapter:
+    """Deliver a root task's subtask terminal/blocker events to an orchestrator.
+
+    The third non-gateway adapter (event-hub F07), after cli (F05) and tui
+    (F06). A ``subscriber_kind='orchestrator'`` subscription is created with
+    ``scope='subtree'`` + ``delivery_policy='supervise'``; on delivery this
+    adapter observes the subscribed (root) task's dependency parents (its
+    subtasks). NOTE on terminology: the colloquial "child task / subtask" is the
+    root's ``task_links`` **parent** in hermes' dependency model — decompose
+    links the root *under* every subtask, so the root waits for its subtasks. On
+    delivery this adapter:
+
+    1. **Claims** its subtasks' terminal+blocker events via
+       :func:`kanban_db.claim_unseen_subtree_events_for_sub` — claim-once, the
+       cursor is the dedup (a re-claim returns nothing, so no duplicate notice).
+       It does its **own** subtree claim rather than consuming the watcher's
+       per-task claim, so the watcher needs no orchestrator-specific branch and
+       gateway/cli/tui dispatch stays byte-for-byte unchanged.
+    2. **Computes fan-in in code** (OQ4) — all subtasks terminal — via
+       :func:`kanban_db.subtree_fan_in_ready`; no new ``task_events`` kind.
+    3. **Persists ONE** supervision notice per delivery (not one row per subtask
+       — OQ3): a human-readable ``message`` line for cli/tui parity plus a
+       structured aggregate-snapshot ``payload`` JSON (OQ5) the orchestrator /
+       F09 re-engagement loop reads to judge the whole subtask set in one turn.
+
+    Observational only: it never creates tasks, judges completion, or changes
+    scheduling/promotion (that stays with ``recompute_ready``); re-engagement
+    (waking the orchestrator) is F09, live wake is M01.
+    """
+
+    _kind = "orchestrator"
+
+    async def deliver(self, runner, delivery: dict) -> DeliveryResult:
+        sub = delivery["sub"]
+        board_slug = delivery.get("board")
+        target_id = _target_id(sub)
+        root_id = sub["task_id"]
+
+        def _persist() -> Optional[bool]:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect(board=board_slug)
+            try:
+                _old, _new, events = _kb.claim_unseen_subtree_events_for_sub(
+                    conn, task_id=root_id, platform=sub["platform"],
+                    chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                )
+                if not events:
+                    return None  # nothing newly claimed → no notice (dedup)
+                snapshot = self._build_snapshot(conn, root_id, board_slug)
+                message = self._build_message(snapshot)
+                _kb.add_notice(
+                    conn,
+                    subscriber_kind=self._kind,
+                    target_id=target_id,
+                    task_id=root_id,
+                    kind="supervision",
+                    message=message,
+                    payload=json.dumps(snapshot, ensure_ascii=False),
+                )
+                return True
+            finally:
+                conn.close()
+
+        try:
+            import asyncio
+
+            wrote = await asyncio.to_thread(_persist)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: orchestrator notice persist failed for %s: %s",
+                root_id, exc,
+            )
+            return DeliveryResult(ok=False)
+        if wrote:
+            logger.debug(
+                "kanban notifier: queued orchestrator supervision notice for "
+                "root %s to target %s on board %s",
+                root_id, target_id, board_slug,
+            )
+        return DeliveryResult(ok=True)
+
+    @staticmethod
+    def _latest_terminal_event(conn, child_id: str):
+        """Most recent terminal/blocker event for ``child_id`` (or None)."""
+        from hermes_cli import kanban_db as _kb
+
+        marks = ",".join("?" * len(_kb.ORCHESTRATOR_CLAIM_KINDS))
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind IN (" + marks + ") "
+            "ORDER BY id DESC LIMIT 1",
+            (child_id, *_kb.ORCHESTRATOR_CLAIM_KINDS),
+        ).fetchone()
+        return row
+
+    def _build_snapshot(self, conn, root_id: str, board_slug) -> dict:
+        """Aggregate-snapshot payload over the root's whole subtask set (OQ5).
+
+        Iterates the subscribed (root) task's dependency parents (its subtasks)
+        — colloquial "child task / subtask" = the root's ``task_links`` parent
+        in hermes' dependency model (the root waits for its subtasks). Carries
+        one row per subtask (never per event — OQ3), each with
+        ``{task_id, title, kind, status, assignee, summary|reason, artifacts}``,
+        plus the ``fan_in_ready`` flag computed in code (OQ4). Inline one-liners
+        (truncated ~200 chars) + ids + artifact paths only — never full bodies.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        children = _kb.parent_ids(conn, root_id)
+        fan_in_ready = _kb.subtree_fan_in_ready(conn, root_id)
+        rows: list[dict] = []
+        for cid in children:
+            task = _kb.get_task(conn, cid)
+            ev = self._latest_terminal_event(conn, cid)
+            kind = ev["kind"] if ev else None
+            payload = {}
+            if ev and ev["payload"]:
+                try:
+                    payload = json.loads(ev["payload"]) or {}
+                except (TypeError, ValueError):
+                    payload = {}
+            child: dict[str, Any] = {
+                "task_id": cid,
+                "title": (task.title if task else None),
+                "kind": kind,
+                "status": (task.status if task else None),
+                "assignee": (task.assignee if task else None),
+            }
+            # blocker → reason; everything else → summary (one-line, truncated).
+            if kind == "blocked":
+                child["reason"] = _truncate_line(payload.get("reason"))
+            else:
+                summary = payload.get("summary")
+                if not summary and task is not None:
+                    summary = task.result
+                child["summary"] = _truncate_line(summary)
+            artifacts = payload.get("artifacts")
+            child["artifacts"] = (
+                [str(a) for a in artifacts]
+                if isinstance(artifacts, (list, tuple))
+                else []
+            )
+            rows.append(child)
+        return {
+            "schema": 1,
+            "parent_id": root_id,
+            "board": board_slug or "default",
+            "fan_in_ready": fan_in_ready,
+            "children": rows,
+        }
+
+    @staticmethod
+    def _build_message(snapshot: dict) -> str:
+        """Human-readable parity line for the structured supervision snapshot."""
+        children = snapshot.get("children", [])
+        done = sum(1 for c in children if c.get("kind") == "completed")
+        blocked = [c for c in children if c.get("kind") == "blocked"]
+        parts = [f"Kanban {snapshot['parent_id']} supervision"]
+        if snapshot.get("fan_in_ready"):
+            parts.append("fan-in ready")
+        counts = f"{done} done"
+        if blocked:
+            counts += f", {len(blocked)} blocked"
+        parts.append(counts)
+        msg = " — ".join(parts)
+        if blocked:
+            first = blocked[0]
+            reason = first.get("reason")
+            tail = f" — {first['task_id']}" + (f": {reason}" if reason else "")
+            msg += tail
+        return msg
+
+
 class CLIDeliveryAdapter(_NoticeDeliveryAdapter):
     """Persist claimed terminal events as CLI notices (``subscriber_kind='cli'``)."""
 
@@ -320,6 +509,7 @@ DELIVERY_ADAPTERS: dict[str, Any] = {
     "gateway": GatewayDeliveryAdapter(),
     "cli": CLIDeliveryAdapter(),
     "tui": TUIDeliveryAdapter(),
+    "orchestrator": OrchestratorDeliveryAdapter(),
 }
 
 

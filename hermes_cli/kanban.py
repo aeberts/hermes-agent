@@ -723,6 +723,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--notifier-profile", default=None,
         help="Profile gateway that owns/delivers this subscription (default: active profile)",
     )
+    # event-hub F07 (OQ6): additive scope/policy flags. Defaults preserve the
+    # F04/F05/F06 behavior exactly; an orchestrator supervises a subtree with
+    # ``--scope subtree --delivery-policy supervise``.
+    p_nsub.add_argument(
+        "--scope", default="task", choices=["task", "subtree"],
+        help="Subscription scope (default: task). 'subtree' (orchestrator) "
+             "claims the parent's child events.",
+    )
+    p_nsub.add_argument(
+        "--delivery-policy", default="channel", choices=["channel", "supervise"],
+        help="Delivery policy (default: channel). 'supervise' persists a "
+             "structured supervision snapshot for an orchestrator.",
+    )
 
     p_nlist = sub.add_parser(
         "notify-list",
@@ -754,6 +767,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Only drain notices for this target id (default: all targets)",
     )
     p_notices.add_argument("--json", action="store_true")
+
+    # --- supervise (event-hub F07): drain orchestrator supervision notices ---
+    p_supervise = sub.add_parser(
+        "supervise",
+        help="Drain pending orchestrator supervision notices for a target "
+             "(subscriber-kind orchestrator). Reading clears them (one-shot).",
+    )
+    p_supervise.add_argument(
+        "--target-id", required=True,
+        help="Orchestrator target id (the --target-id used at notify-subscribe)",
+    )
+    p_supervise.add_argument(
+        "--json", action="store_true",
+        help="Print the structured supervision payload (default: the message line)",
+    )
 
     # --- log ---
     p_log = sub.add_parser(
@@ -1004,6 +1032,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
             "notices":            _cmd_notices,
+            "supervise":          _cmd_supervise,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
@@ -2499,6 +2528,8 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             thread_id=thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
             subscriber_kind=kind, target=target,
+            scope=getattr(args, "scope", None) or "task",
+            delivery_policy=getattr(args, "delivery_policy", None) or "channel",
         )
     # ``platform`` already holds the right label in both branches — the real
     # gateway platform (telegram/discord/…) for gateway subs, or the kind for
@@ -2562,6 +2593,40 @@ def _cmd_notices(args: argparse.Namespace) -> int:
         return 0
     if not notices:
         print("(no notices)")
+        return 0
+    for n in notices:
+        print(n["message"])
+    return 0
+
+
+def _cmd_supervise(args: argparse.Namespace) -> int:
+    """Drain pending orchestrator supervision notices for a target (event-hub F07).
+
+    The orchestrator adapter persists one structured supervision snapshot per
+    delivery into the shared ``kanban_notices`` store, keyed by
+    ``subscriber_kind='orchestrator'`` + target id. Reading is a one-shot drain
+    (claim-once parity with ``kanban notices``). ``--json`` prints the structured
+    ``payload`` snapshot; plain prints the human-readable ``message`` line.
+    """
+    with kb.connect_closing() as conn:
+        notices = kb.drain_notices(
+            conn, subscriber_kind="orchestrator", target_id=args.target_id,
+        )
+    if getattr(args, "json", False):
+        payloads = []
+        for n in notices:
+            raw = n.get("payload")
+            if raw:
+                try:
+                    payloads.append(json.loads(raw))
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            payloads.append({"message": n.get("message")})
+        print(json.dumps(payloads, indent=2, ensure_ascii=False))
+        return 0
+    if not notices:
+        print("(no supervision notices)")
         return 0
     for n in notices:
         print(n["message"])

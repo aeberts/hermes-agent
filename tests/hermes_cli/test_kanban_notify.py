@@ -839,3 +839,40 @@ def test_get_delivery_adapter_cli_registered(kanban_home):
     # gateway adapter still present.
     assert get_delivery_adapter("gateway") is not None
     assert get_delivery_adapter(None) is not None
+
+
+def test_notify_subscribe_scope_and_delivery_policy_flags(kanban_home):
+    """F07: additive --scope/--delivery-policy persist on the sub row;
+    defaults preserve the F04/F05/F06 behavior exactly."""
+    import re
+    tid = re.search(
+        r"(t_[a-f0-9]+)", kc.run_slash("create 'orch root' --assignee alice")
+    ).group(1)
+
+    # Orchestrator subtree/supervise subscription.
+    out = kc.run_slash(
+        f"notify-subscribe {tid} --subscriber-kind orchestrator "
+        f"--target-id orch-1 --scope subtree --delivery-policy supervise"
+    )
+    assert "orchestrator:orch-1" in out
+    conn = kb.connect()
+    try:
+        s = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+    assert s["subscriber_kind"] == "orchestrator"
+    assert s["scope"] == "subtree"
+    assert s["delivery_policy"] == "supervise"
+
+    # Defaults: an ordinary cli sub stays task/channel.
+    tid2 = re.search(
+        r"(t_[a-f0-9]+)", kc.run_slash("create 'cli root' --assignee alice")
+    ).group(1)
+    kc.run_slash(f"notify-subscribe {tid2} --subscriber-kind cli --target-id sess")
+    conn = kb.connect()
+    try:
+        s2 = kb.list_notify_subs(conn, tid2)[0]
+    finally:
+        conn.close()
+    assert s2["scope"] == "task"
+    assert s2["delivery_policy"] == "channel"

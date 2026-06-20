@@ -4766,3 +4766,148 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator subtree claim + notice payload (event-hub F07)
+# ---------------------------------------------------------------------------
+
+def _orch_sub(conn, parent_id, target_id="orch"):
+    """Create an orchestrator(subtree, supervise) sub and return its surrogate id."""
+    return kb.add_notify_sub(
+        conn, task_id=parent_id, platform="orchestrator", chat_id=target_id,
+        subscriber_kind="orchestrator", scope="subtree",
+        delivery_policy="supervise",
+    )
+
+
+def test_add_notify_sub_persists_scope_and_delivery_policy(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root")
+        _orch_sub(conn, parent, "orch-1")
+        sub = kb.list_notify_subs(conn, parent)[0]
+        assert sub["scope"] == "subtree"
+        assert sub["delivery_policy"] == "supervise"
+        # Defaults preserved for an ordinary gateway sub.
+        other = kb.create_task(conn, title="gw")
+        kb.add_notify_sub(conn, task_id=other, platform="telegram", chat_id="c")
+        gw = kb.list_notify_subs(conn, other)[0]
+        assert gw["scope"] == "task"
+        assert gw["delivery_policy"] == "channel"
+    finally:
+        conn.close()
+
+
+def test_notice_payload_round_trip(kanban_home):
+    """add_notice stores a JSON payload; drain_notices returns it verbatim."""
+    import json
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t")
+        snap = {"schema": 1, "parent_id": tid, "fan_in_ready": True, "children": []}
+        kb.add_notice(
+            conn, subscriber_kind="orchestrator", target_id="orch-1",
+            task_id=tid, kind="supervision", message="msg",
+            payload=json.dumps(snap),
+        )
+        rows = kb.drain_notices(conn, subscriber_kind="orchestrator", target_id="orch-1")
+        assert len(rows) == 1
+        assert json.loads(rows[0]["payload"]) == snap
+        # cli/tui notices keep payload NULL.
+        kb.add_notice(
+            conn, subscriber_kind="cli", target_id="sess", task_id=tid,
+            kind="completed", message="done",
+        )
+        cli_rows = kb.drain_notices(conn, subscriber_kind="cli", target_id="sess")
+        assert cli_rows[0]["payload"] is None
+    finally:
+        conn.close()
+
+
+def test_subtree_claim_gathers_direct_children_terminal_events(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root")
+        a = kb.create_task(conn, title="a")
+        b = kb.create_task(conn, title="b")
+        kb.complete_task(conn, a, summary="a done")
+        kb.block_task(conn, b, reason="stuck")
+        # Real decompose direction: each subtask is the PARENT of the root.
+        kb.link_tasks(conn, a, parent)
+        kb.link_tasks(conn, b, parent)
+        sub_id = _orch_sub(conn, parent)
+
+        old, new, events = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        kinds = sorted(e.kind for e in events)
+        assert kinds == ["blocked", "completed"]
+        assert {e.task_id for e in events} == {a, b}
+        assert new > old
+    finally:
+        conn.close()
+
+
+def test_subtree_claim_dedups_on_recelaim_via_cursor_cas(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root")
+        a = kb.create_task(conn, title="a")
+        kb.complete_task(conn, a, summary="x")
+        kb.link_tasks(conn, a, parent)  # subtask is the root's parent
+        sub_id = _orch_sub(conn, parent)
+
+        _o1, _n1, first = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        assert len(first) == 1
+        # Re-claim: cursor already advanced past the event → nothing.
+        _o2, _n2, second = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        assert second == []
+        assert _n2 == _o2, "cursor unchanged on an empty re-claim"
+    finally:
+        conn.close()
+
+
+def test_subtree_claim_ignores_non_terminal_and_zero_children(kanban_home):
+    conn = kb.connect()
+    try:
+        # Zero children → empty, cursor untouched.
+        lonely = kb.create_task(conn, title="lonely")
+        sub_id = _orch_sub(conn, lonely, "orch-lonely")
+        old, new, events = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        assert events == []
+        assert old == new
+
+        # A subtask with only a non-terminal event yields nothing.
+        parent = kb.create_task(conn, title="root2")
+        c = kb.create_task(conn, title="c")
+        kb.link_tasks(conn, c, parent)  # subtask is the root's parent
+        with kb.write_txn(conn):
+            kb._append_event(conn, c, kind="heartbeat")
+        sub2 = _orch_sub(conn, parent, "orch-2")
+        _o, _n, evs = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub2)
+        assert evs == []
+    finally:
+        conn.close()
+
+
+def test_subtree_fan_in_ready(kanban_home):
+    conn = kb.connect()
+    try:
+        # A root with no subtasks (no task_links parents) is never fan-in-ready.
+        lonely = kb.create_task(conn, title="lonely")
+        assert kb.subtree_fan_in_ready(conn, lonely) is False
+
+        # Real decompose direction: each subtask is the PARENT of the root, so
+        # the subtasks are NOT gated by the root and can be driven terminal
+        # directly — no unlink/relink gymnastics.
+        parent = kb.create_task(conn, title="root")
+        a = kb.create_task(conn, title="a")
+        b = kb.create_task(conn, title="b")
+        kb.complete_task(conn, a, summary="a")
+        kb.link_tasks(conn, a, parent)
+        kb.link_tasks(conn, b, parent)  # b is todo → active
+        assert kb.subtree_fan_in_ready(conn, parent) is False
+
+        kb.complete_task(conn, b, summary="b")
+        assert kb.subtree_fan_in_ready(conn, parent) is True
+    finally:
+        conn.close()
