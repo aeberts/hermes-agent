@@ -8898,6 +8898,136 @@ def drain_notices(
 
 
 # ---------------------------------------------------------------------------
+# Orchestrator re-engagement (event-hub F09) — close-the-loop handoff
+# ---------------------------------------------------------------------------
+
+# Recognizable structured-comment prefix mirroring the kanban_swarm blackboard
+# convention (``BLACKBOARD_PREFIX``). The re-spawned orchestrator turn reads its
+# root's comment thread via ``build_worker_context``; this prefix lets the
+# injected orchestrator guidance (KANBAN_GUIDANCE) recognize + parse the curated
+# fan-in handoff. Format of an emitted comment body:
+#
+#     [kanban:reengage] <human line>
+#     <JSON snapshot block>
+#
+# where the JSON block is the F07 aggregate snapshot verbatim (schema, parent_id,
+# board, fan_in_ready, children[]).
+REENGAGE_PREFIX = "[kanban:reengage] "
+
+# Default author stamped on a re-engagement comment.
+REENGAGE_AUTHOR = "orchestrator"
+
+
+@dataclass
+class ReengageResult:
+    """One root re-engaged by :func:`reengage_orchestrator`.
+
+    ``root_id`` is the orchestrator root (the drained notice's ``task_id`` /
+    snapshot ``parent_id``); ``comment_id`` is the surrogate id of the single
+    re-engagement comment appended to that root this pass.
+    """
+
+    root_id: str
+    comment_id: int
+
+
+def _reengage_comment_body(snapshot: dict) -> str:
+    """Render the structured re-engagement comment body for a fan-in snapshot.
+
+    A recognizable ``[kanban:reengage]`` prefix + a one-line human summary +
+    the JSON snapshot block, so the re-spawned orchestrator turn (which reads
+    the root's comment thread via ``build_worker_context``) can both eyeball
+    and machine-parse the curated fan-in aggregate. Mirrors the
+    ``kanban_swarm`` blackboard comment shape but stays self-contained.
+    """
+    children = snapshot.get("children") or []
+    done = sum(1 for c in children if c.get("kind") == "completed")
+    blocked = sum(1 for c in children if c.get("kind") == "blocked")
+    parent_id = snapshot.get("parent_id")
+    human = (
+        f"Fan-in ready for {parent_id}: {len(children)} subtask(s), "
+        f"{done} done, {blocked} blocked. Judge the goal, route more work, "
+        f"or finish."
+    )
+    block = json.dumps(snapshot, ensure_ascii=False, indent=2)
+    return f"{REENGAGE_PREFIX}{human}\n{block}"
+
+
+def reengage_orchestrator(
+    conn: sqlite3.Connection,
+    *,
+    target_id: str,
+    author: str = REENGAGE_AUTHOR,
+) -> list[ReengageResult]:
+    """Materialize F07 fan-in snapshots into re-engagement comments (event-hub F09).
+
+    The consumer of F07's orchestrator supervision notices and the heartbeat
+    that closes the autonomous loop: drains the orchestrator notices for
+    ``target_id`` (one-shot, claim-once), groups them by ``parent_id`` (root),
+    and for each root whose **latest** drained notice has ``fan_in_ready=true``
+    appends ONE structured re-engagement comment to that root carrying the
+    aggregate snapshot. The comment lands in the root's comment thread, which
+    ``build_worker_context`` surfaces to the re-spawned orchestrator turn — so
+    the curated fan-in handoff reaches the fresh turn in-context with zero new
+    read path (OQ-B).
+
+    Re-engages ONLY on ``fan_in_ready=true``. A drained ``fan_in_ready=false``
+    (partial) notice is passive visibility — it is consumed by the drain but
+    writes no comment (no wake-per-partial-batch). Because each F07 snapshot is
+    a FULL aggregate, dropping a superseded partial on drain loses nothing.
+
+    Idempotency is the one-shot drain (OQ-C): a re-run with no new notice is a
+    no-op, and a second decompose round (new subtasks → new F07 fan-in notice)
+    correctly yields a second re-engagement. NO separate "already reengaged"
+    marker is written — that would break the multi-round loop.
+
+    Observational toward scheduling: the only mutation is the comment (+ its
+    ``commented`` event). No promotion, status write, or task creation — the
+    root re-promotion stays ``recompute_ready``'s job (OQ-A).
+
+    Returns one :class:`ReengageResult` (root_id + comment_id) per re-engaged
+    root, in the order the roots' fan-in notices were drained.
+    """
+    notices = drain_notices(
+        conn, subscriber_kind="orchestrator", target_id=target_id,
+    )
+    # Group by root (parent_id), keeping the LATEST drained snapshot per root.
+    # drain_notices returns oldest-first, so a later row for the same root wins
+    # — at most one re-engagement comment per root per pass.
+    latest_by_root: dict[str, dict] = {}
+    order: list[str] = []
+    for n in notices:
+        raw = n.get("payload")
+        if not raw:
+            continue
+        try:
+            snapshot = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(snapshot, dict):
+            continue
+        root_id = snapshot.get("parent_id") or n.get("task_id")
+        if not root_id:
+            continue
+        if root_id not in latest_by_root:
+            order.append(root_id)
+        latest_by_root[root_id] = snapshot
+
+    results: list[ReengageResult] = []
+    for root_id in order:
+        snapshot = latest_by_root[root_id]
+        # Re-engage only on a true fan-in; partial notices are passive (skip).
+        if not snapshot.get("fan_in_ready"):
+            continue
+        body = _reengage_comment_body(snapshot)
+        # add_comment opens its own write_txn (and emits the ``commented``
+        # event); do NOT wrap this in another open txn (the nesting pitfall).
+        comment_id = add_comment(conn, root_id, author=author, body=body)
+        results.append(ReengageResult(root_id=root_id, comment_id=comment_id))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Retention + garbage collection
 # ---------------------------------------------------------------------------
 

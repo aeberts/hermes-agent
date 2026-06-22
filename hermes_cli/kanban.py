@@ -783,6 +783,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Print the structured supervision payload (default: the message line)",
     )
 
+    # --- reengage (event-hub F09): close-the-loop orchestrator re-engagement ---
+    p_reengage = sub.add_parser(
+        "reengage",
+        help="Materialize F07 fan-in snapshots into a re-engagement comment on "
+             "each ready root (subscriber-kind orchestrator). Drains one-shot.",
+    )
+    p_reengage.add_argument(
+        "--target-id", required=True,
+        help="Orchestrator target id (the --target-id used at notify-subscribe)",
+    )
+    p_reengage.add_argument(
+        "--json", action="store_true",
+        help="Emit a machine-readable list of re-engaged roots (root_id + "
+             "comment_id) instead of the human summary",
+    )
+
     # --- log ---
     p_log = sub.add_parser(
         "log",
@@ -1033,6 +1049,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-unsubscribe": _cmd_notify_unsubscribe,
             "notices":            _cmd_notices,
             "supervise":          _cmd_supervise,
+            "reengage":           _cmd_reengage,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
@@ -2630,6 +2647,34 @@ def _cmd_supervise(args: argparse.Namespace) -> int:
         return 0
     for n in notices:
         print(n["message"])
+    return 0
+
+
+def _cmd_reengage(args: argparse.Namespace) -> int:
+    """Close-the-loop orchestrator re-engagement pass (event-hub F09).
+
+    Runs :func:`kanban_db.reengage_orchestrator` for ``--target-id``: drains
+    F07 orchestrator supervision notices (one-shot), and for each root whose
+    latest drained notice is ``fan_in_ready`` appends ONE structured
+    ``[kanban:reengage]`` comment carrying the fan-in snapshot to that root.
+    ``build_worker_context`` then surfaces that comment to the re-spawned
+    orchestrator turn. Partial (non-fan-in) notices are consumed but produce no
+    comment. ``--json`` emits the machine-readable list of re-engaged roots; a
+    second invocation reports nothing (idempotent via the one-shot drain).
+    """
+    with kb.connect_closing() as conn:
+        results = kb.reengage_orchestrator(conn, target_id=args.target_id)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            [{"root_id": r.root_id, "comment_id": r.comment_id} for r in results],
+            indent=2, ensure_ascii=False,
+        ))
+        return 0
+    if not results:
+        print("(no roots re-engaged)")
+        return 0
+    for r in results:
+        print(f"re-engaged {r.root_id} (comment {r.comment_id})")
     return 0
 
 
