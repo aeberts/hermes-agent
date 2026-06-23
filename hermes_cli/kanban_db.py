@@ -5745,6 +5745,23 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# --- Supervisor-dispatch guards (event-hub F11, OQ-5) ----------------------
+# A supervised root (one with an ``subscriber_kind='orchestrator'`` notify-sub)
+# whose blocked child the supervisor can't/doesn't resolve stays ``blocked``, so
+# the per-tick board scan would otherwise re-spawn a supervisor every tick
+# forever. These two consts brake that cycle, mirroring the worker
+# cooldown / consecutive-failure machinery (no new schema): supervisor runs are
+# recorded as ``task_runs`` rows with ``step_key='supervisor'``.
+#
+# Cooldown: minimum wall-clock seconds between supervisor turns for one root, so
+# a transient crash gets spaced retries rather than a tight loop.
+_SUPERVISOR_COOLDOWN_SECONDS = 120
+# Breaker: after this many consecutive supervisor turns that did NOT resolve the
+# block (child still ``blocked`` after the turn), stop auto-spawning — the block
+# is parked "escalated / awaiting human". The counter resets once a resolution
+# occurs (child no longer ``blocked``), so a later re-block re-engages.
+_SUPERVISOR_FAILURE_LIMIT = 3
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -5848,6 +5865,13 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    supervised: list[str] = field(default_factory=list)
+    """Root task ids for which an orchestrator-mode supervisor turn was spawned
+    this tick (event-hub F11). A supervised root (one with an
+    ``subscriber_kind='orchestrator'`` notify-sub) that has a ``blocked`` child
+    gets a fresh orchestrator-mode wake to triage the block — turning the silent
+    deadlock into an automatic re-engagement. Guarded by liveness / cooldown /
+    breaker (see :func:`_dispatch_once_locked`)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7037,6 +7061,7 @@ def dispatch_once(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    supervisor_spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
@@ -7071,6 +7096,7 @@ def dispatch_once(
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            supervisor_spawn_fn=supervisor_spawn_fn,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
@@ -7087,6 +7113,7 @@ def dispatch_once(
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            supervisor_spawn_fn=supervisor_spawn_fn,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
@@ -7103,6 +7130,7 @@ def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    supervisor_spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
@@ -7498,7 +7526,209 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # ---- supervisor dispatch (event-hub F11-core: auto-wake on block) ----
+    # A blocked child does NOT re-promote its root (a blocked task isn't
+    # terminal), so stock ready-dispatch never spawns anything to triage it →
+    # the silent deadlock. This loop closes that gap: for each supervised root
+    # (one carrying an ``subscriber_kind='orchestrator'`` notify-sub) that has a
+    # ``blocked`` child, it wakes a fresh ORCHESTRATOR-MODE turn (via
+    # ``_supervisor_spawn``, which omits ``HERMES_KANBAN_TASK`` so the root's
+    # profile gets the orchestrator-only ``kanban_unblock``/``kanban_list``
+    # tools) to answer+unblock or escalate to the human.
+    #
+    # Keyed on blocked-child STATUS, not on a pending handoff (OQ-2): a child
+    # auto-blocked by the dispatcher breaker (quota/auth) carries no F07 notice,
+    # so a status scan is the only thing that catches the headline case. The
+    # scan is idempotent/self-healing — it re-derives "needs a supervisor" each
+    # tick the way ready-dispatch re-derives "needs a worker".
+    #
+    # Guards (OQ-5) use ``task_runs`` rows with ``step_key='supervisor'`` (no
+    # schema change): concurrency (a live supervisor PID), cooldown (spaced
+    # retries), and a breaker (park after K no-resolution turns; reset once the
+    # child is no longer blocked). Same concurrency budget as the other loops.
+    _sup_spawn = (
+        supervisor_spawn_fn if supervisor_spawn_fn is not None
+        else _supervisor_spawn
+    )
+    seen_roots: set[str] = set()
+    for sub in list_notify_subs(conn):
+        if sub.get("subscriber_kind") != "orchestrator":
+            continue
+        root_id = sub.get("task_id")
+        if not root_id or root_id in seen_roots:
+            continue
+        seen_roots.add(root_id)
+        if max_spawn is not None and running_count + spawned >= max_spawn:
+            break
+        root_task = get_task(conn, root_id)
+        if root_task is None:
+            continue
+        # Blocked children = the root's subtasks (decomposition links the root
+        # UNDER each subtask, so the subtasks are the root's parents) that are
+        # currently ``blocked``.
+        blocked_children = [
+            cid for cid in parent_ids(conn, root_id)
+            if (t := get_task(conn, cid)) is not None and t.status == "blocked"
+        ]
+        if not blocked_children:
+            continue
+        # Skip roots whose assignee isn't a spawnable profile — the same guard
+        # the ready/review loops apply (PR #20105). An orchestrator root pointed
+        # at a non-existent profile is a common footgun; bucket it as
+        # nonspawnable here instead of letting ``_supervisor_spawn`` launch a
+        # subprocess that immediately exits with "Profile '<x>' does not exist"
+        # (which would also churn the cooldown/breaker on a spawn that never ran).
+        try:
+            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        except Exception:
+            profile_exists = None  # type: ignore[assignment]
+        if not root_task.assignee or (
+            profile_exists is not None and not profile_exists(root_task.assignee)
+        ):
+            result.skipped_nonspawnable.append(root_id)
+            continue
+        # --- OQ-5 guards (concurrency / cooldown / breaker) ---
+        if _supervisor_skip_guarded(conn, root_id, blocked_children):
+            continue
+        if dry_run:
+            result.supervised.append(root_id)
+            continue
+        try:
+            import inspect
+            try:
+                sig = inspect.signature(_sup_spawn)
+                if "board" in sig.parameters:
+                    pid = _sup_spawn(root_task, board=board)
+                else:
+                    pid = _sup_spawn(root_task)
+            except (TypeError, ValueError):
+                pid = _sup_spawn(root_task)
+            _record_supervisor_run(
+                conn, root_id, worker_pid=int(pid) if pid else None,
+            )
+            result.supervised.append(root_id)
+            spawned += 1
+        except Exception as exc:
+            # Never crash the tick on a supervisor-spawn failure; record the
+            # attempt so the cooldown/breaker still advance and a transient
+            # failure gets spaced retries rather than a tight loop.
+            _record_supervisor_run(conn, root_id, worker_pid=None, error=str(exc))
     return result
+
+
+def _record_supervisor_run(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    worker_pid: Optional[int],
+    error: Optional[str] = None,
+) -> int:
+    """Insert a ``task_runs`` row marking a supervisor turn for ``root_id``.
+
+    Tagged ``step_key='supervisor'`` so the OQ-5 guards can find supervisor
+    runs without a schema change. Left open (``status='running'``,
+    ``ended_at IS NULL``) so the concurrency guard's PID-liveness check applies
+    until the supervisor process exits; the breaker keys on ``started_at``
+    ordering, not on ``ended_at``.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        trow = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (root_id,),
+        ).fetchone()
+        profile = trow["assignee"] if trow else None
+        cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                worker_pid, started_at, error
+            ) VALUES (?, ?, 'supervisor', 'running', ?, ?, ?)
+            """,
+            (root_id, profile, worker_pid, now, error),
+        )
+    return int(cur.lastrowid or 0)
+
+
+def _supervisor_skip_guarded(
+    conn: sqlite3.Connection,
+    root_id: str,
+    blocked_children: list[str],
+) -> bool:
+    """Return True when a supervisor turn for ``root_id`` must be skipped.
+
+    Implements the three OQ-5 guards over supervisor ``task_runs`` rows
+    (``step_key='supervisor'``):
+
+    - **concurrency:** a run with ``ended_at IS NULL`` whose ``worker_pid`` is
+      still alive → a supervisor is mid-turn; skip.
+    - **cooldown:** the latest supervisor run started within
+      ``_SUPERVISOR_COOLDOWN_SECONDS`` → too soon; skip.
+    - **breaker:** ``_SUPERVISOR_FAILURE_LIMIT`` consecutive supervisor runs
+      *since the current block episode began* → parked "escalated / awaiting
+      human"; skip. "Since the current block episode" = supervisor runs started
+      at/after the most recent ``blocked`` event among the still-blocked
+      children. A resolution un-blocks the child (the caller then never reaches
+      here); a later re-block writes a fresh ``blocked`` event with a newer
+      timestamp, so the older runs drop out of the count and the breaker
+      RESETS — a re-block re-engages.
+    """
+    rows = conn.execute(
+        "SELECT worker_pid, started_at, ended_at FROM task_runs "
+        "WHERE task_id = ? AND step_key = 'supervisor' "
+        "ORDER BY started_at DESC, id DESC",
+        (root_id,),
+    ).fetchall()
+    if not rows:
+        return False
+    # concurrency: any open run with a live PID → a supervisor is running.
+    for r in rows:
+        if r["ended_at"] is None and _pid_alive(r["worker_pid"]):
+            return True
+    # cooldown: latest run too recent.
+    latest_started = rows[0]["started_at"]
+    if latest_started is not None and (
+        int(time.time()) - int(latest_started) < _SUPERVISOR_COOLDOWN_SECONDS
+    ):
+        return True
+    # breaker: count only supervisor runs in the current block episode. The
+    # episode start = the newest ``blocked`` event across the still-blocked
+    # children. Runs that predate it belong to a resolved (then re-blocked)
+    # episode and must not count → the counter resets on re-block.
+    episode_start = _latest_block_event_at(conn, blocked_children)
+    if episode_start is None:
+        # No block-event timestamp (e.g. breaker auto-block before the event
+        # log existed, or direct DB manipulation in tests) — count all runs.
+        episode_runs = len(rows)
+    else:
+        episode_runs = sum(
+            1 for r in rows
+            if r["started_at"] is not None and int(r["started_at"]) >= episode_start
+        )
+    if episode_runs >= _SUPERVISOR_FAILURE_LIMIT:
+        return True
+    return False
+
+
+def _latest_block_event_at(
+    conn: sqlite3.Connection, child_ids: list[str],
+) -> Optional[int]:
+    """Return the newest ``blocked`` event ``created_at`` among ``child_ids``.
+
+    Marks the start of the current block episode for the breaker's
+    "runs since the last resolution" count. Returns ``None`` when no child has a
+    ``blocked`` event (e.g. a breaker auto-block predating the event log)."""
+    if not child_ids:
+        return None
+    placeholders = ",".join("?" * len(child_ids))
+    row = conn.execute(
+        "SELECT MAX(created_at) AS ts FROM task_events "
+        f"WHERE kind = 'blocked' AND task_id IN ({placeholders})",
+        child_ids,
+    ).fetchone()
+    if row is None or row["ts"] is None:
+        return None
+    return int(row["ts"])
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
@@ -7933,6 +8163,116 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    return proc.pid
+
+
+def _supervisor_spawn(
+    root_task: Task,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Fire-and-forget orchestrator-mode supervisor turn for a supervised root.
+
+    A thin variant of :func:`_default_spawn` (event-hub F11-core). Whereas
+    ``_default_spawn`` always sets ``HERMES_KANBAN_TASK`` — pinning the child to
+    a single task and thereby withholding the orchestrator-only
+    ``kanban_unblock`` / ``kanban_list`` tools (gated on that var being ABSENT
+    in ``tools/kanban_tools.py`` ``_check_kanban_orchestrator_mode``) — this
+    spawn deliberately OMITS it. That one missing env var is what makes the
+    fresh turn an *orchestrator* turn, able to triage / answer+unblock / route
+    the root's blocked child.
+
+    Env mirrors ``_default_spawn``'s board/profile pinning (board-scoped
+    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_WORKSPACES_ROOT`` /
+    ``HERMES_KANBAN_BOARD``, profile-scoped ``HERMES_HOME``, ``HERMES_PROFILE``)
+    but omits the task-worker-only vars (``HERMES_KANBAN_TASK``,
+    ``HERMES_KANBAN_WORKSPACE``, ``HERMES_KANBAN_RUN_ID``,
+    ``HERMES_KANBAN_CLAIM_LOCK``, goal-mode). Returns the spawned child's PID.
+    """
+    import subprocess
+    if not root_task.assignee:
+        raise ValueError(f"root task {root_task.id} has no assignee")
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    profile_arg = normalize_profile_name(root_task.assignee)
+
+    prompt = (
+        f"You are the supervising orchestrator for kanban root {root_task.id}. "
+        "Inspect the goal and its subtasks, and take the single most "
+        "appropriate action to keep work moving: if a subtask is blocked "
+        "awaiting a decision you can make, record the decision as a comment "
+        "and unblock it; if it needs the human, say so explicitly and stop."
+    )
+
+    env = dict(os.environ)
+    # Profile-scoped HERMES_HOME so the supervisor reads the orchestrator
+    # profile's config.yaml (same rationale as _default_spawn).
+    try:
+        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Profile dir doesn't exist (test fixtures) — defer to the CLI's
+        # _apply_profile_override() via HERMES_PROFILE below.
+        pass
+    if root_task.tenant:
+        env["HERMES_TENANT"] = root_task.tenant
+    # CRITICAL: do NOT set HERMES_KANBAN_TASK here. Its ABSENCE is the single
+    # line that makes this an orchestrator-mode turn (kanban_unblock /
+    # kanban_list become available). Likewise omit the task-worker-only vars
+    # (HERMES_KANBAN_WORKSPACE / RUN_ID / CLAIM_LOCK / GOAL_MODE).
+    # Board pinning — identical to _default_spawn so the supervisor scopes to
+    # the exact board the dispatcher ticked.
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    env["HERMES_KANBAN_BOARD"] = resolved_board
+    # HERMES_PROFILE is the comment author + profile the child activates.
+    env["HERMES_PROFILE"] = profile_arg
+
+    cmd = [
+        *_resolve_hermes_argv(),
+        "-p", profile_arg,
+        # Profile-scoped HERMES_HOME above → pass --accept-hooks so the
+        # supervisor session still registers configured hooks (as
+        # _default_spawn does for workers).
+        "--accept-hooks",
+    ]
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    if worker_toolsets:
+        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    # Top-level `-z` (one-shot), NOT `chat -q`. One-shot is the right shape for
+    # a single fresh inspect→triage/judge→stop supervisor turn (it does not want
+    # `chat -q`'s kanban goal-loop wrapping). It ALSO deliberately sidesteps the
+    # `chat -q`×Codex tool-wiring bug (orthogonal upstream provider bug, tracked
+    # as event-hub R03) until upstream fixes it — so the supervisor's kanban
+    # tools wire correctly under Codex today.
+    cmd.extend(["-z", prompt])
+
+    # Log to the same per-board logs dir as workers, keyed on the root id.
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{root_task.id}.supervisor.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "`hermes` executable not found on PATH. "
+            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+        )
+    # See _default_spawn — we intentionally keep log_f open for the child.
     return proc.pid
 
 
