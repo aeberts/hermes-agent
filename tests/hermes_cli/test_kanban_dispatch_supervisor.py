@@ -13,6 +13,7 @@ The OQ-5 guards (concurrency / cooldown / breaker) are driven by manipulating
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -367,5 +368,165 @@ def test_fan_in_root_no_supervisor_but_stock_dispatch_unaffected(
         # Stock ready-dispatch promoted + spawned the root as before.
         assert root in worker_calls
         assert any(s[0] == root for s in res.spawned)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Increment 2 (reengage-in-tick): the dispatch tick runs reengage_orchestrator
+# once per orchestrator target each tick, BEFORE the fan-in re-promotion, so the
+# F09/F10 handoff comment exists before the re-promoted root is re-spawned.
+#
+# Mirrors the notice-seeding helpers from tests/hermes_cli/test_kanban_reengage.py
+# (F07-shaped orchestrator notices via add_notice + a fan-in snapshot payload).
+# ---------------------------------------------------------------------------
+
+def _add_orchestrator_notice(target_id: str, root_id: str, snapshot: dict) -> int:
+    """Hand-build an F07-shaped orchestrator supervision notice (snapshot payload)."""
+    conn = kb.connect()
+    try:
+        return kb.add_notice(
+            conn,
+            subscriber_kind="orchestrator",
+            target_id=target_id,
+            task_id=root_id,
+            kind="supervision",
+            message=f"Kanban {root_id} supervision",
+            payload=json.dumps(snapshot, ensure_ascii=False),
+        )
+    finally:
+        conn.close()
+
+
+def _snapshot(root_id: str, *, fan_in_ready: bool, children=None) -> dict:
+    return {
+        "schema": 1,
+        "parent_id": root_id,
+        "board": "default",
+        "fan_in_ready": fan_in_ready,
+        "children": children or [],
+    }
+
+
+def _comment_bodies(conn, root_id: str) -> list[str]:
+    return [c.body for c in kb.list_comments(conn, root_id)]
+
+
+def test_reengage_in_tick_fan_in_writes_reengage_handoff(kanban_home):
+    """fan_in_ready=true notice → dispatch tick writes a [kanban:reengage]
+    comment on the root and result.reengaged lists it (Increment 2 fan-in)."""
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="root goal", assignee="worker")
+        child = kb.create_task(conn, title="child A", assignee="worker")
+        _subscribe_orchestrator(conn, root, target_id="orch-fanin")
+        snap = _snapshot(
+            root, fan_in_ready=True,
+            children=[{"task_id": child, "title": "child A", "kind": "completed",
+                       "status": "done", "assignee": "worker",
+                       "summary": "A finished", "artifacts": []}],
+        )
+        _add_orchestrator_notice("orch-fanin", root, snap)
+
+        res = kb.dispatch_once(conn)
+
+        assert root in res.reengaged
+        bodies = _comment_bodies(conn, root)
+        assert any(b.startswith(kb.REENGAGE_PREFIX) for b in bodies)
+    finally:
+        conn.close()
+
+
+def test_reengage_in_tick_blocked_writes_triage_handoff(kanban_home):
+    """A blocked-child snapshot (fan_in_ready=false) → dispatch tick writes a
+    [kanban:triage] comment on the root and result.reengaged lists it."""
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="root goal", assignee="worker")
+        _subscribe_orchestrator(conn, root, target_id="orch-triage")
+        snap = _snapshot(
+            root, fan_in_ready=False,
+            children=[{"task_id": "t_child", "title": "child", "kind": "blocked",
+                       "status": "blocked", "assignee": "worker",
+                       "reason": "needs a decision", "artifacts": []}],
+        )
+        _add_orchestrator_notice("orch-triage", root, snap)
+
+        res = kb.dispatch_once(conn)
+
+        assert root in res.reengaged
+        bodies = _comment_bodies(conn, root)
+        assert any(b.startswith(kb.TRIAGE_PREFIX) for b in bodies)
+    finally:
+        conn.close()
+
+
+def test_reengage_in_tick_idempotent_second_tick_noop(kanban_home):
+    """A second dispatch tick with no new notice → no duplicate handoff comment
+    and result.reengaged is empty that tick (one-shot drain idempotency)."""
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="root goal", assignee="worker")
+        _subscribe_orchestrator(conn, root, target_id="orch-idem")
+        _add_orchestrator_notice(
+            "orch-idem", root, _snapshot(root, fan_in_ready=True),
+        )
+
+        res1 = kb.dispatch_once(conn)
+        assert root in res1.reengaged
+        bodies_after_first = _comment_bodies(conn, root)
+        n_reengage = sum(
+            1 for b in bodies_after_first if b.startswith(kb.REENGAGE_PREFIX)
+        )
+        assert n_reengage == 1
+
+        res2 = kb.dispatch_once(conn)
+        assert res2.reengaged == []
+        bodies_after_second = _comment_bodies(conn, root)
+        assert sum(
+            1 for b in bodies_after_second if b.startswith(kb.REENGAGE_PREFIX)
+        ) == 1
+    finally:
+        conn.close()
+
+
+def test_reengage_in_tick_no_orchestrator_subs_is_noop(kanban_home):
+    """A board with no orchestrator subscription → result.reengaged == [] and no
+    handoff comment is written."""
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="root goal", assignee="worker")
+        # No _subscribe_orchestrator and no notices.
+
+        res = kb.dispatch_once(conn)
+
+        assert res.reengaged == []
+        assert _comment_bodies(conn, root) == []
+    finally:
+        conn.close()
+
+
+def test_reengage_in_tick_dry_run_skips_reengage(kanban_home):
+    """dry_run skips the (mutating) reengage: no handoff comment, empty
+    result.reengaged, and the seeded notice is NOT drained (still present)."""
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="root goal", assignee="worker")
+        _subscribe_orchestrator(conn, root, target_id="orch-dry")
+        _add_orchestrator_notice(
+            "orch-dry", root, _snapshot(root, fan_in_ready=True),
+        )
+
+        res = kb.dispatch_once(conn, dry_run=True)
+
+        assert res.reengaged == []
+        bodies = _comment_bodies(conn, root)
+        assert not any(b.startswith(kb.REENGAGE_PREFIX) for b in bodies)
+
+        # The notice was NOT drained — still claimable on a live (non-dry) tick.
+        remaining = kb.drain_notices(
+            conn, subscriber_kind="orchestrator", target_id="orch-dry",
+        )
+        assert len(remaining) == 1
     finally:
         conn.close()

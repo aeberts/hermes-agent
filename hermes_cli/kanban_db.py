@@ -5872,6 +5872,12 @@ class DispatchResult:
     gets a fresh orchestrator-mode wake to triage the block — turning the silent
     deadlock into an automatic re-engagement. Guarded by liveness / cooldown /
     breaker (see :func:`_dispatch_once_locked`)."""
+    reengaged: list[str] = field(default_factory=list)
+    """Root task ids for which ``reengage_orchestrator`` wrote a handoff this tick
+    (event-hub F11 Increment 2). Run once per orchestrator target each tick,
+    BEFORE the fan-in re-promotion, so the ``[kanban:reengage]`` (fan-in) /
+    ``[kanban:triage]`` (blocked) handoff comment exists before the re-promoted
+    root is re-spawned and reads it via ``build_worker_context``."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7196,6 +7202,43 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Reengage-in-tick (event-hub F11 Increment 2): drain F07 orchestrator
+    # supervision notices and write the F09/F10 handoff comment, ONCE per
+    # orchestrator target, BEFORE the fan-in re-promotion below. The ordering
+    # is load-bearing: ``recompute_ready`` may re-promote a fan-in root, which
+    # is then claimed + spawned later in this same tick; the re-spawned root
+    # reads its handoff via ``build_worker_context``, so the
+    # ``[kanban:reengage]`` / ``[kanban:triage]`` comment must already exist
+    # by then (the F09/M07 ordering requirement). F07 supervision notices are
+    # produced by the gateway watcher; this is their in-tick consumer (it does
+    # NOT itself drive F07 ``deliver()``). ``reengage_orchestrator`` mutates
+    # (writes a comment via its own ``write_txn``), so it is skipped under
+    # ``dry_run``. NOTE: this is entirely separate from the F11-core
+    # supervisor-dispatch loop near the END of the tick — do not merge them.
+    if not dry_run:
+        _reengage_targets: list[str] = []
+        _seen_targets: set[str] = set()
+        for sub in list_notify_subs(conn):
+            if sub.get("subscriber_kind") != "orchestrator":
+                continue
+            # Resolve the subscription's notice target id the same way the
+            # gateway's delivery adapter does (F04 convention: prefer the
+            # ``target`` JSON's ``target_id``, fall back to ``chat_id``) so the
+            # dispatcher drains the exact ``kanban_notices.target_id`` the
+            # watcher wrote.
+            target = _resolve_sub_target_id(sub)
+            if not target or target in _seen_targets:
+                continue
+            _seen_targets.add(target)
+            _reengage_targets.append(target)
+        for target in _reengage_targets:
+            try:
+                for r in reengage_orchestrator(conn, target_id=target):
+                    result.reengaged.append(r.root_id)
+            except Exception:
+                # One bad target must not crash the dispatch tick — skip it
+                # and continue draining the remaining orchestrator targets.
+                continue
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -8799,6 +8842,28 @@ def add_notify_sub(
         thread_id=thread_id,
     )
     return int(sub_id) if sub_id is not None else 0
+
+
+def _resolve_sub_target_id(sub: dict) -> str:
+    """Resolve a non-gateway subscription's notice target id (event-hub F04).
+
+    Mirrors ``gateway.kanban_delivery._target_id`` (kept in sync, but inlined so
+    the DB layer carries no gateway import): F04 persists a non-gateway
+    subscription with ``chat_id=<target-id>`` and a ``target`` JSON carrying
+    ``{"subscriber_kind": ..., "target_id": ...}``. Prefer the structured
+    ``target`` id, fall back to ``chat_id``. Used by the reengage-in-tick block
+    (F11 Increment 2) so the dispatcher drains the exact
+    ``kanban_notices.target_id`` the watcher wrote for this subscription.
+    """
+    raw = sub.get("target")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            data = None
+        if isinstance(data, dict) and data.get("target_id"):
+            return str(data["target_id"])
+    return str(sub.get("chat_id") or "")
 
 
 def list_notify_subs(
