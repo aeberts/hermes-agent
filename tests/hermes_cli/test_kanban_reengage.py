@@ -1,4 +1,19 @@
-"""Tests for orchestrator re-engagement / close-the-loop (event-hub F09).
+"""Tests for orchestrator re-engagement / close-the-loop (event-hub F09 + F10).
+
+F10 extends F09's single consumer (``reengage_orchestrator``) to BRANCH on the
+drained F07 snapshot: a ``fan_in_ready`` snapshot still writes the F09
+``[kanban:reengage]`` comment (judge), while a snapshot carrying a blocked child
+(``kind=="blocked"``) writes a new ``[kanban:triage]`` handoff (answer / unblock
+/ escalate) carrying ``{trigger:"blocked", child id, reason}`` + the snapshot.
+The two branches are mutually exclusive per snapshot (a blocked child is never
+terminal, so a snapshot is never both blocked and fan-in-ready), and idempotency
+is still the F07 one-shot drain — a re-block after unblock is a new claimed event
+→ a new triage handoff. F10 is enqueue-only (it writes the handoff; it does NOT
+wake the supervisor — that's F11).
+
+The original F09 docstring follows.
+
+Tests for orchestrator re-engagement / close-the-loop (event-hub F09).
 
 F09 is the consumer of F07's orchestrator supervision notices: it drains those
 notices for a target, groups them by ``parent_id`` (root), and for each root
@@ -85,6 +100,23 @@ def _complete(conn, task_id: str, **kw) -> None:
 
 def _block(conn, task_id: str, **kw) -> None:
     assert kb.block_task(conn, task_id, **kw) is True
+
+
+def _unblock(conn, task_id: str) -> None:
+    assert kb.unblock_task(conn, task_id) is True
+
+
+def _blocked_child(task_id: str, *, reason: str, title: str = "child") -> dict:
+    """An F07-shaped blocked child row (mirrors the orchestrator adapter)."""
+    return {
+        "task_id": task_id,
+        "title": title,
+        "kind": "blocked",
+        "status": "blocked",
+        "assignee": "worker1",
+        "reason": reason,
+        "artifacts": [],
+    }
 
 
 def _link(conn, root_id: str, subtask_id: str) -> None:
@@ -364,3 +396,204 @@ def test_end_to_end_real_decompose_reengages_root(kanban_home):
     assert kb.REENGAGE_PREFIX in ctx
     assert sub_a in ctx and sub_b in ctx
     assert '"fan_in_ready": true' in ctx
+
+
+# --- F10: blocker-triggered triage handoff ----------------------------------
+
+def test_blocked_child_writes_one_triage_handoff_visible_in_context(kanban_home):
+    """Tests Needed #1: a blocked child → exactly one [kanban:triage] handoff on
+    the root carrying child id + reason; visible in build_worker_context."""
+    root = _create("root goal")
+    child = _create("child A")
+    snap = _snapshot(
+        root, fan_in_ready=False,
+        children=[_blocked_child(child, reason="needs API key", title="child A")],
+    )
+    _add_orchestrator_notice("orch-b1", root, snap)
+
+    results = _reengage("orch-b1")
+    assert len(results) == 1
+    assert results[0].root_id == root
+    assert results[0].comment_id > 0
+    assert results[0].trigger == "blocked"
+
+    comments = _comments(root)
+    assert len(comments) == 1
+    body = comments[0].body
+    assert body.startswith(kb.TRIAGE_PREFIX)
+    assert child in body
+    assert "needs API key" in body
+    # The triage block is machine-parseable and carries the resolved fields.
+    parsed = json.loads(body[body.index("{"):])
+    assert parsed["trigger"] == "blocked"
+    assert parsed["child"] == child
+    assert parsed["reason"] == "needs API key"
+    assert parsed["snapshot"]["parent_id"] == root
+
+    # The handoff is surfaced to the re-spawned orchestrator turn.
+    conn = kb.connect()
+    try:
+        ctx = kb.build_worker_context(conn, root)
+    finally:
+        conn.close()
+    assert kb.TRIAGE_PREFIX in ctx
+    assert child in ctx
+    assert "needs API key" in ctx
+
+
+def test_partial_with_no_block_writes_no_triage_and_is_idempotent(kanban_home):
+    """Tests Needed #2: a partial with no blocked child → no triage; re-run with
+    nothing new is a no-op (idempotent via the one-shot drain)."""
+    root = _create("root")
+    child = _create("child A")
+    # A partial snapshot: one completed child, none blocked, not fan-in-ready.
+    snap = _snapshot(
+        root, fan_in_ready=False,
+        children=[{"task_id": child, "title": "child A", "kind": "completed",
+                   "status": "running", "assignee": "worker1",
+                   "summary": "A done", "artifacts": []}],
+    )
+    _add_orchestrator_notice("orch-b2", root, snap)
+
+    assert _reengage("orch-b2") == []
+    assert _comments(root) == []
+
+    # Re-run with nothing new in the drained store → still a no-op.
+    assert _reengage("orch-b2") == []
+    assert _comments(root) == []
+
+
+def test_block_unblock_block_yields_second_triage_handoff(kanban_home):
+    """Tests Needed #3: block → unblock → block again → a SECOND triage handoff
+    (multi-round; a re-block is a new claimed event, no separate marker)."""
+    root = _create("root")
+    child = _create("child A")
+
+    # Round 1: blocked → triage.
+    _add_orchestrator_notice(
+        "orch-b3", root,
+        _snapshot(root, fan_in_ready=False,
+                  children=[_blocked_child(child, reason="round-1 question")]),
+    )
+    r1 = _reengage("orch-b3")
+    assert len(r1) == 1 and r1[0].trigger == "blocked"
+    assert len(_comments(root)) == 1
+
+    # Unblock (and re-block): a fresh F07 notice for the same root/child.
+    _add_orchestrator_notice(
+        "orch-b3", root,
+        _snapshot(root, fan_in_ready=False,
+                  children=[_blocked_child(child, reason="round-2 question")]),
+    )
+    r2 = _reengage("orch-b3")
+    assert len(r2) == 1 and r2[0].trigger == "blocked"
+    comments = _comments(root)
+    assert len(comments) == 2
+    # The second handoff carries the new reason.
+    parsed = json.loads(comments[1].body[comments[1].body.index("{"):])
+    assert parsed["reason"] == "round-2 question"
+
+
+def test_composition_block_then_fan_in_each_fire_once(kanban_home):
+    """Tests Needed #4: block (→triage) then later complete-all (→fan-in) both
+    fire once each; no masking. Driven through real decompose + F07 delivery."""
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="orchestrated goal", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn, root, root_assignee="orchestrator",
+            children=[{"title": "subtask A"}, {"title": "subtask B"}],
+        )
+    finally:
+        conn.close()
+    assert child_ids is not None and len(child_ids) == 2
+    sub_a, sub_b = child_ids
+
+    sub = _subscribe_orchestrator(root, "orch-b4")
+
+    # Phase 1: subtask A blocks → F07 emits a snapshot with a blocked child →
+    # one triage handoff. (block requires a running task; claim it first.)
+    conn = kb.connect()
+    try:
+        assert kb.claim_task(conn, sub_a, claimer="worker1") is not None
+        _block(conn, sub_a, reason="A is stuck")
+    finally:
+        conn.close()
+    _deliver(sub)
+    r_block = _reengage("orch-b4")
+    assert len(r_block) == 1
+    assert r_block[0].trigger == "blocked"
+    assert len(_comments(root)) == 1
+    assert _comments(root)[0].body.startswith(kb.TRIAGE_PREFIX)
+
+    # Phase 2: unblock A, complete both → fan-in flips true → one reengage.
+    conn = kb.connect()
+    try:
+        _unblock(conn, sub_a)
+        _complete(conn, sub_a, summary="A done")
+        _complete(conn, sub_b, summary="B done")
+    finally:
+        conn.close()
+    _deliver(sub)
+    r_fanin = _reengage("orch-b4")
+    assert len(r_fanin) == 1
+    assert r_fanin[0].trigger == "fan_in"
+    comments = _comments(root)
+    # Exactly one of each: the triage (phase 1) and the reengage (phase 2).
+    assert len(comments) == 2
+    assert comments[0].body.startswith(kb.TRIAGE_PREFIX)
+    assert comments[1].body.startswith(kb.REENGAGE_PREFIX)
+
+    # Both handoffs are surfaced; no masking, no double-fire.
+    conn = kb.connect()
+    try:
+        ctx = kb.build_worker_context(conn, root)
+    finally:
+        conn.close()
+    assert kb.TRIAGE_PREFIX in ctx
+    assert kb.REENGAGE_PREFIX in ctx
+
+
+def test_cli_reengage_triage_reports_trigger(kanban_home):
+    """CLI: a blocked-child snapshot → `triaged <root>` human line + trigger in
+    --json (backward-compatible root_id/comment_id retained)."""
+    root = _create("root")
+    child = _create("child A")
+    _add_orchestrator_notice(
+        "orch-b5", root,
+        _snapshot(root, fan_in_ready=False,
+                  children=[_blocked_child(child, reason="blocked-cli")]),
+    )
+
+    out = kc.run_slash("reengage --target-id orch-b5")
+    assert f"triaged {root}" in out
+
+    # Re-run drains nothing → empty.
+    out2 = kc.run_slash("reengage --target-id orch-b5")
+    assert "(no roots re-engaged)" in out2
+
+
+def test_cli_reengage_json_includes_trigger(kanban_home):
+    """CLI --json: triage result carries trigger=blocked alongside root_id +
+    comment_id; fan-in carries trigger=fan_in."""
+    root_b = _create("root blocked")
+    child = _create("child A")
+    _add_orchestrator_notice(
+        "orch-b6", root_b,
+        _snapshot(root_b, fan_in_ready=False,
+                  children=[_blocked_child(child, reason="q")]),
+    )
+    out = kc.run_slash("reengage --target-id orch-b6 --json")
+    data = json.loads(out)
+    assert len(data) == 1
+    assert data[0]["root_id"] == root_b
+    assert isinstance(data[0]["comment_id"], int)
+    assert data[0]["trigger"] == "blocked"
+
+    root_f = _create("root fanin")
+    _add_orchestrator_notice("orch-b7", root_f,
+                             _snapshot(root_f, fan_in_ready=True))
+    out_f = kc.run_slash("reengage --target-id orch-b7 --json")
+    data_f = json.loads(out_f)
+    assert len(data_f) == 1
+    assert data_f[0]["trigger"] == "fan_in"

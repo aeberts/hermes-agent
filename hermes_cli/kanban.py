@@ -786,8 +786,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- reengage (event-hub F09): close-the-loop orchestrator re-engagement ---
     p_reengage = sub.add_parser(
         "reengage",
-        help="Materialize F07 fan-in snapshots into a re-engagement comment on "
-             "each ready root (subscriber-kind orchestrator). Drains one-shot.",
+        help="Materialize F07 snapshots into a handoff comment on each root "
+             "(subscriber-kind orchestrator): a fan-in reengage or a blocked "
+             "triage. Drains one-shot.",
     )
     p_reengage.add_argument(
         "--target-id", required=True,
@@ -795,8 +796,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_reengage.add_argument(
         "--json", action="store_true",
-        help="Emit a machine-readable list of re-engaged roots (root_id + "
-             "comment_id) instead of the human summary",
+        help="Emit a machine-readable list of handed-off roots (root_id + "
+             "comment_id + trigger) instead of the human summary",
     )
 
     # --- log ---
@@ -2651,22 +2652,31 @@ def _cmd_supervise(args: argparse.Namespace) -> int:
 
 
 def _cmd_reengage(args: argparse.Namespace) -> int:
-    """Close-the-loop orchestrator re-engagement pass (event-hub F09).
+    """Close-the-loop orchestrator re-engagement pass (event-hub F09 + F10).
 
     Runs :func:`kanban_db.reengage_orchestrator` for ``--target-id``: drains
-    F07 orchestrator supervision notices (one-shot), and for each root whose
-    latest drained notice is ``fan_in_ready`` appends ONE structured
-    ``[kanban:reengage]`` comment carrying the fan-in snapshot to that root.
-    ``build_worker_context`` then surfaces that comment to the re-spawned
-    orchestrator turn. Partial (non-fan-in) notices are consumed but produce no
-    comment. ``--json`` emits the machine-readable list of re-engaged roots; a
-    second invocation reports nothing (idempotent via the one-shot drain).
+    F07 orchestrator supervision notices (one-shot) and branches per root on its
+    latest drained snapshot — a ``fan_in_ready`` snapshot appends a
+    ``[kanban:reengage]`` comment (judge), a snapshot with a blocked child
+    appends a ``[kanban:triage]`` handoff (answer/unblock/escalate), and a
+    partial with neither produces no comment. ``build_worker_context`` then
+    surfaces the comment to the re-spawned orchestrator turn. ``--json`` emits
+    the machine-readable list of handed-off roots (``root_id``, ``comment_id``,
+    ``trigger``); a second invocation reports nothing (idempotent via the
+    one-shot drain).
     """
     with kb.connect_closing() as conn:
         results = kb.reengage_orchestrator(conn, target_id=args.target_id)
     if getattr(args, "json", False):
         print(json.dumps(
-            [{"root_id": r.root_id, "comment_id": r.comment_id} for r in results],
+            [
+                {
+                    "root_id": r.root_id,
+                    "comment_id": r.comment_id,
+                    "trigger": r.trigger,
+                }
+                for r in results
+            ],
             indent=2, ensure_ascii=False,
         ))
         return 0
@@ -2674,7 +2684,8 @@ def _cmd_reengage(args: argparse.Namespace) -> int:
         print("(no roots re-engaged)")
         return 0
     for r in results:
-        print(f"re-engaged {r.root_id} (comment {r.comment_id})")
+        verb = "triaged" if r.trigger == "blocked" else "re-engaged"
+        print(f"{verb} {r.root_id} (comment {r.comment_id})")
     return 0
 
 

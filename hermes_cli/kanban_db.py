@@ -8914,6 +8914,19 @@ def drain_notices(
 # board, fan_in_ready, children[]).
 REENGAGE_PREFIX = "[kanban:reengage] "
 
+# Recognizable structured-comment prefix for the F10 blocker-triggered handoff.
+# Block/triage is a distinct lifecycle outcome, not a flavor of completed, so it
+# earns its own marker (OQ-1). The re-spawned orchestrator turn reads its root's
+# comment thread via ``build_worker_context``; this prefix lets the injected
+# orchestrator guidance recognize + parse a curated triage handoff. Format of an
+# emitted comment body:
+#
+#     [kanban:triage] <human line>
+#     <JSON triage block>
+#
+# where the JSON block carries ``{trigger:"blocked", child, reason, snapshot}``.
+TRIAGE_PREFIX = "[kanban:triage] "
+
 # Default author stamped on a re-engagement comment.
 REENGAGE_AUTHOR = "orchestrator"
 
@@ -8924,11 +8937,15 @@ class ReengageResult:
 
     ``root_id`` is the orchestrator root (the drained notice's ``task_id`` /
     snapshot ``parent_id``); ``comment_id`` is the surrogate id of the single
-    re-engagement comment appended to that root this pass.
+    handoff comment appended to that root this pass. ``trigger`` distinguishes
+    the F09 fan-in re-engagement (``"fan_in"``) from the F10 blocker-triggered
+    triage handoff (``"blocked"``). Defaults to ``"fan_in"`` so existing F09
+    constructors stay source-compatible.
     """
 
     root_id: str
     comment_id: int
+    trigger: str = "fan_in"
 
 
 def _reengage_comment_body(snapshot: dict) -> str:
@@ -8953,28 +8970,60 @@ def _reengage_comment_body(snapshot: dict) -> str:
     return f"{REENGAGE_PREFIX}{human}\n{block}"
 
 
+def _triage_comment_body(snapshot: dict, blocked_child: dict) -> str:
+    """Render the structured triage handoff body for a blocked-child snapshot.
+
+    Mirrors :func:`_reengage_comment_body`'s shape — a recognizable
+    ``[kanban:triage]`` prefix + a one-line human summary + a JSON block — so the
+    re-spawned orchestrator turn (which reads the root's comment thread via
+    ``build_worker_context``) can both eyeball and machine-parse the curated
+    blocker handoff. The JSON block carries ``{trigger:"blocked", child id,
+    reason}`` plus the full F07 snapshot for context.
+    """
+    parent_id = snapshot.get("parent_id")
+    child_id = blocked_child.get("task_id")
+    reason = blocked_child.get("reason")
+    human = (
+        f"Triage needed for {parent_id}: child {child_id} is blocked"
+        + (f" — {reason}" if reason else "")
+        + ". Answer via comment + unblock, or escalate."
+    )
+    triage = {
+        "trigger": "blocked",
+        "child": child_id,
+        "reason": reason,
+        "snapshot": snapshot,
+    }
+    block = json.dumps(triage, ensure_ascii=False, indent=2)
+    return f"{TRIAGE_PREFIX}{human}\n{block}"
+
+
 def reengage_orchestrator(
     conn: sqlite3.Connection,
     *,
     target_id: str,
     author: str = REENGAGE_AUTHOR,
 ) -> list[ReengageResult]:
-    """Materialize F07 fan-in snapshots into re-engagement comments (event-hub F09).
+    """Materialize F07 snapshots into handoff comments (event-hub F09 + F10).
 
-    The consumer of F07's orchestrator supervision notices and the heartbeat
-    that closes the autonomous loop: drains the orchestrator notices for
-    ``target_id`` (one-shot, claim-once), groups them by ``parent_id`` (root),
-    and for each root whose **latest** drained notice has ``fan_in_ready=true``
-    appends ONE structured re-engagement comment to that root carrying the
-    aggregate snapshot. The comment lands in the root's comment thread, which
-    ``build_worker_context`` surfaces to the re-spawned orchestrator turn — so
-    the curated fan-in handoff reaches the fresh turn in-context with zero new
-    read path (OQ-B).
+    The single consumer of F07's orchestrator supervision notices and the
+    heartbeat that closes the autonomous loop: drains the orchestrator notices
+    for ``target_id`` (one-shot, claim-once), groups them by ``parent_id``
+    (root), keeps each root's **latest** drained snapshot, and **branches** on
+    it (the two arms are mutually exclusive per snapshot):
 
-    Re-engages ONLY on ``fan_in_ready=true``. A drained ``fan_in_ready=false``
-    (partial) notice is passive visibility — it is consumed by the drain but
-    writes no comment (no wake-per-partial-batch). Because each F07 snapshot is
-    a FULL aggregate, dropping a superseded partial on drain loses nothing.
+    - ``fan_in_ready=true`` → ONE ``[kanban:reengage]`` comment carrying the
+      aggregate snapshot (F09 fan-in → judge / route more work / finish).
+    - a **blocked** child (``kind=="blocked"``; implies ``fan_in_ready`` false,
+      since a blocked child is never terminal) → ONE ``[kanban:triage]`` handoff
+      carrying ``{trigger:"blocked", child id, reason}`` + the snapshot (F10
+      blocker-triggered triage → answer / unblock / escalate).
+    - neither (a partial with no blocked child) → passive; no comment.
+
+    The comment lands in the root's comment thread, which ``build_worker_context``
+    surfaces to the re-spawned orchestrator turn — so the curated handoff reaches
+    the fresh turn in-context with zero new read path (OQ-B). Each F07 snapshot
+    is a FULL aggregate, so dropping a superseded partial on drain loses nothing.
 
     Idempotency is the one-shot drain (OQ-C): a re-run with no new notice is a
     no-op, and a second decompose round (new subtasks → new F07 fan-in notice)
@@ -8985,8 +9034,8 @@ def reengage_orchestrator(
     ``commented`` event). No promotion, status write, or task creation — the
     root re-promotion stays ``recompute_ready``'s job (OQ-A).
 
-    Returns one :class:`ReengageResult` (root_id + comment_id) per re-engaged
-    root, in the order the roots' fan-in notices were drained.
+    Returns one :class:`ReengageResult` (root_id + comment_id + trigger) per
+    root that produced a handoff, in the order the roots' notices were drained.
     """
     notices = drain_notices(
         conn, subscriber_kind="orchestrator", target_id=target_id,
@@ -9016,14 +9065,34 @@ def reengage_orchestrator(
     results: list[ReengageResult] = []
     for root_id in order:
         snapshot = latest_by_root[root_id]
-        # Re-engage only on a true fan-in; partial notices are passive (skip).
-        if not snapshot.get("fan_in_ready"):
+        children = snapshot.get("children") or []
+        # Branch on the drained snapshot (event-hub F10). The two arms are
+        # mutually exclusive by construction: fan_in_ready requires ALL children
+        # terminal, but a blocked child is NOT terminal, so a snapshot is never
+        # both blocked-and-fan-in-ready (a blocker naturally masks fan-in —
+        # correct: don't judge "done" while a child is stuck).
+        if snapshot.get("fan_in_ready"):
+            # F09 fan-in re-engagement → judge. Body unchanged.
+            body = _reengage_comment_body(snapshot)
+            # add_comment opens its own write_txn (and emits the ``commented``
+            # event); do NOT wrap this in another open txn (the nesting pitfall).
+            comment_id = add_comment(conn, root_id, author=author, body=body)
+            results.append(ReengageResult(
+                root_id=root_id, comment_id=comment_id, trigger="fan_in",
+            ))
             continue
-        body = _reengage_comment_body(snapshot)
-        # add_comment opens its own write_txn (and emits the ``commented``
-        # event); do NOT wrap this in another open txn (the nesting pitfall).
-        comment_id = add_comment(conn, root_id, author=author, body=body)
-        results.append(ReengageResult(root_id=root_id, comment_id=comment_id))
+        blocked_child = next(
+            (c for c in children if c.get("kind") == "blocked"), None,
+        )
+        if blocked_child is not None:
+            # F10 blocker-triggered triage → answer / unblock / escalate.
+            body = _triage_comment_body(snapshot, blocked_child)
+            comment_id = add_comment(conn, root_id, author=author, body=body)
+            results.append(ReengageResult(
+                root_id=root_id, comment_id=comment_id, trigger="blocked",
+            ))
+            continue
+        # Neither fan-in nor a blocked child → passive partial; skip (no comment).
     return results
 
 
