@@ -9038,6 +9038,32 @@ ORCHESTRATOR_CLAIM_KINDS: tuple[str, ...] = (
 )
 
 
+def _subtree_closure_ids(conn: sqlite3.Connection, root_id: str) -> list[str]:
+    """The observed task_id set for an orchestrator-subtree subscription.
+
+    The node's **closure** = ``{root_id} ∪ {its direct subtasks}`` (event-hub
+    F13). The root's direct subtasks are its ``task_links`` parents: decompose
+    links the root under every child (``parent_id = subtask, child_id = root``),
+    so the root's direct parents are exactly the subtasks it waits on (no
+    transitive walk — F08 generalizes that).
+
+    This is the SINGLE source of truth shared by
+    :func:`claim_unseen_subtree_events_for_sub` (the authoritative,
+    cursor-advancing claim) and :func:`subtree_has_unseen_events_for_sub` (the
+    read-only watcher-gate peek) so the two can never diverge — the n=1
+    (childless card) case fires identically through both.
+    """
+    ids = [root_id]
+    ids.extend(
+        r["parent_id"]
+        for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (root_id,),
+        ).fetchall()
+    )
+    return ids
+
+
 def claim_unseen_subtree_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -9068,7 +9094,8 @@ def claim_unseen_subtree_events_for_sub(
     writer lock and a re-claim returns nothing.
 
     Returns ``(old_cursor, new_cursor, events)`` — empty events leave the cursor
-    untouched. A root with zero subtasks returns ``(cursor, cursor, [])``.
+    untouched. The observed set is the node's closure (``{node} ∪ subtasks``),
+    so a childless card (n=1) fires on its OWN terminal event (event-hub F13).
     """
     kind_list = list(kinds)
     with write_txn(conn):
@@ -9090,27 +9117,23 @@ def claim_unseen_subtree_events_for_sub(
             return 0, 0, []
         root_id = row["task_id"]
         old_cursor = int(row["last_event_id"])
-        # The subscribed root's dependency parents ARE its subtasks: decompose
-        # links the root under every child (parent_id = subtask, child_id =
-        # root), so direct parents = all subtasks — no transitive walk needed.
-        # F08 generalizes this to the transitive subtree.
-        subtask_ids = [
-            r["parent_id"]
-            for r in conn.execute(
-                "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-                (root_id,),
-            ).fetchall()
-        ]
-        if not subtask_ids:
-            return old_cursor, old_cursor, []
+        # The observed set is the node's CLOSURE = {node} ∪ {its direct
+        # subtasks} (event-hub F13). The subscribed root's dependency parents
+        # ARE its subtasks: decompose links the root under every child
+        # (parent_id = subtask, child_id = root), so direct parents = all
+        # subtasks — no transitive walk needed. Including the node itself makes
+        # the n=1 (childless card) case fire on its own terminal event; for a
+        # decompose root (alive/todo through supervision) it is a no-op until
+        # the root completes. F08 generalizes this to the transitive subtree.
+        closure_ids = _subtree_closure_ids(conn, root_id)
         q = (
             "SELECT * FROM task_events "
-            "WHERE task_id IN (" + ",".join("?" * len(subtask_ids)) + ") "
+            "WHERE task_id IN (" + ",".join("?" * len(closure_ids)) + ") "
             "AND id > ? "
             "AND kind IN (" + ",".join("?" * len(kind_list)) + ") "
             "ORDER BY id ASC"
         )
-        params: list[Any] = [*subtask_ids, old_cursor, *kind_list]
+        params: list[Any] = [*closure_ids, old_cursor, *kind_list]
         rows = conn.execute(q, params).fetchall()
         events: list[Event] = []
         new_cursor = old_cursor
@@ -9160,8 +9183,9 @@ def subtree_has_unseen_events_for_sub(
     :func:`claim_unseen_subtree_events_for_sub` inside the orchestrator adapter.
     The watcher only peeks here; the adapter is the sole claimer.
 
-    Returns ``True`` iff at least one unseen subtree event exists. A root with
-    zero subtasks (or no unseen events) returns ``False``.
+    Returns ``True`` iff at least one unseen closure event exists. The observed
+    set is the node's closure (``{node} ∪ subtasks``), so a childless card (n=1)
+    can return ``True`` on its own terminal event (event-hub F13).
     """
     kind_list = list(kinds)
     resolved = _resolve_notify_sub_id(
@@ -9182,23 +9206,20 @@ def subtree_has_unseen_events_for_sub(
         return False
     root_id = row["task_id"]
     old_cursor = int(row["last_event_id"])
-    subtask_ids = [
-        r["parent_id"]
-        for r in conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-            (root_id,),
-        ).fetchall()
-    ]
-    if not subtask_ids:
-        return False
+    # Observe the node's CLOSURE = {node} ∪ {its direct subtasks} — the EXACT
+    # same selection as claim_unseen_subtree_events_for_sub (event-hub F13).
+    # Keeping these two identical is load-bearing: the watcher gate peeks here
+    # while the adapter claims there, so a divergence would make the n=1 case
+    # peek "nothing" while the claim would deliver.
+    closure_ids = _subtree_closure_ids(conn, root_id)
     q = (
         "SELECT 1 FROM task_events "
-        "WHERE task_id IN (" + ",".join("?" * len(subtask_ids)) + ") "
+        "WHERE task_id IN (" + ",".join("?" * len(closure_ids)) + ") "
         "AND id > ? "
         "AND kind IN (" + ",".join("?" * len(kind_list)) + ") "
         "LIMIT 1"
     )
-    params: list[Any] = [*subtask_ids, old_cursor, *kind_list]
+    params: list[Any] = [*closure_ids, old_cursor, *kind_list]
     return conn.execute(q, params).fetchone() is not None
 
 
