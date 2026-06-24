@@ -1019,6 +1019,84 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         return False
 
 
+def _subscribe_target(task_id: str) -> tuple[str, str]:
+    """Resolve the orchestrator subscription's (platform, chat_id) target.
+
+    Mirrors how :func:`_maybe_auto_subscribe` resolves the calling session's
+    identity (``HERMES_SESSION_PLATFORM`` / ``HERMES_SESSION_CHAT_ID``), but for
+    an **orchestrator-subtree** sub. For a real channel session we want the
+    notice to ride that session's chat back; for a CLI session (no channel) we
+    fall back to a DETERMINISTIC target derived from the task_id, so the row is
+    still found by ``list_notify_subs`` / ``reengage_orchestrator`` (which key
+    off ``subscriber_kind=='orchestrator'`` + ``task_id``) and stays idempotent
+    on repeat calls.
+    """
+    chat_id = ""
+    try:
+        from gateway.session_context import get_session_env
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+    except Exception:
+        chat_id = ""
+    if not chat_id:
+        chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "") or ""
+    if not chat_id:
+        # CLI / unattached: no channel. Derive a stable per-task target so the
+        # sub is reengage-pickup-able and de-dups on repeat calls.
+        chat_id = f"orch:{task_id}"
+    return "orchestrator", chat_id
+
+
+def _handle_subscribe(args: dict, **kw) -> str:
+    """Subscribe the calling orchestrator to a task's closure (event-hub F13).
+
+    Writes the SAME subscription shape the orchestrator delivery adapter (F07)
+    and the reengage-in-tick (F11) key off: ``subscriber_kind='orchestrator'``,
+    ``scope='subtree'``, ``delivery_policy='supervise'``. The observed set is the
+    node's closure (``{node} ∪ its direct subtasks``), so a single childless card
+    fires on its own terminal event while a decompose root fans in on its
+    subtasks. Idempotent — a repeat call on the same task is a no-op (F04 dedup).
+    """
+    guard = _require_orchestrator_tool("kanban_subscribe")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    tid = str(tid)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"kanban_subscribe: unknown task {tid}")
+            platform, chat_id = _subscribe_target(tid)
+            notifier_profile = os.environ.get("HERMES_PROFILE")
+            sub_id = kb.add_notify_sub(
+                conn, task_id=tid,
+                platform=platform, chat_id=chat_id,
+                notifier_profile=notifier_profile,
+                subscriber_kind="orchestrator",
+                scope="subtree",
+                delivery_policy="supervise",
+            )
+            return _ok(
+                task_id=tid,
+                subscription_id=sub_id,
+                subscriber_kind="orchestrator",
+                scope="subtree",
+                delivery_policy="supervise",
+                target=chat_id,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_subscribe: {e}")
+    except Exception as e:
+        logger.exception("kanban_subscribe failed")
+        return tool_error(f"kanban_subscribe: {e}")
+
+
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task back to ready."""
     guard = _require_orchestrator_tool("kanban_unblock")
@@ -1555,6 +1633,31 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_SUBSCRIBE_SCHEMA = {
+    "name": "kanban_subscribe",
+    "description": (
+        "Subscribe to a task so you are re-engaged when its work blocks or "
+        "finishes — instead of polling kanban_list. Observes the task's "
+        "closure: the task itself plus its direct subtasks (tasks linked as "
+        "its dependencies). Use this to supervise a decomposed goal (subscribe "
+        "to the root, then end your turn) or to be told when a single card is "
+        "done. Idempotent — calling twice on the same task is a no-op."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": (
+                    "Task id to subscribe to (a goal root or a single card)."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -1639,4 +1742,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_subscribe",
+    toolset="kanban",
+    schema=KANBAN_SUBSCRIBE_SCHEMA,
+    handler=_handle_subscribe,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🔔",
 )

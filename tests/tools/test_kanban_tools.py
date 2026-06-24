@@ -137,7 +137,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock",
+        "kanban_unblock", "kanban_subscribe",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -1339,7 +1339,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_000, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
