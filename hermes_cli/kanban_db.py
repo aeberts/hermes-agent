@@ -9135,6 +9135,73 @@ def claim_unseen_subtree_events_for_sub(
         return old_cursor, new_cursor, events
 
 
+def subtree_has_unseen_events_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    sub_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    kinds: Iterable[str] = ORCHESTRATOR_CLAIM_KINDS,
+) -> bool:
+    """Read-only peek: does the subscribed root's subtree have ≥1 unseen event?
+
+    The non-advancing companion to :func:`claim_unseen_subtree_events_for_sub`
+    (event-hub F12). It runs the *exact same selection* — the root's
+    ``task_links`` parents (its subtasks) emitting terminal+blocker events with
+    ``id > last_event_id`` — but only checks **existence** (``LIMIT 1``) and
+    **never writes the cursor**: there is no ``BEGIN IMMEDIATE`` and no
+    ``UPDATE ... last_event_id`` CAS.
+
+    It exists so the notifier watcher can *gate* orchestrator-subtree delivery
+    without claiming: exactly one subtree claim may advance the cursor per
+    delivery, and that owner stays
+    :func:`claim_unseen_subtree_events_for_sub` inside the orchestrator adapter.
+    The watcher only peeks here; the adapter is the sole claimer.
+
+    Returns ``True`` iff at least one unseen subtree event exists. A root with
+    zero subtasks (or no unseen events) returns ``False``.
+    """
+    kind_list = list(kinds)
+    resolved = _resolve_notify_sub_id(
+        conn,
+        sub_id=sub_id,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    if resolved is None:
+        return False
+    row = conn.execute(
+        "SELECT task_id, last_event_id FROM kanban_notify_subs WHERE id = ?",
+        (resolved,),
+    ).fetchone()
+    if row is None:
+        return False
+    root_id = row["task_id"]
+    old_cursor = int(row["last_event_id"])
+    subtask_ids = [
+        r["parent_id"]
+        for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (root_id,),
+        ).fetchall()
+    ]
+    if not subtask_ids:
+        return False
+    q = (
+        "SELECT 1 FROM task_events "
+        "WHERE task_id IN (" + ",".join("?" * len(subtask_ids)) + ") "
+        "AND id > ? "
+        "AND kind IN (" + ",".join("?" * len(kind_list)) + ") "
+        "LIMIT 1"
+    )
+    params: list[Any] = [*subtask_ids, old_cursor, *kind_list]
+    return conn.execute(q, params).fetchone() is not None
+
+
 def subtree_fan_in_ready(conn: sqlite3.Connection, root_id: str) -> bool:
     """Return True iff every one of the root's parents (subtasks) is terminal.
 

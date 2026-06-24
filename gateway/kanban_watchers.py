@@ -271,16 +271,48 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
-                                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                    conn,
-                                    task_id=sub["task_id"],
-                                    platform=sub["platform"],
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
-                                )
-                                if not events:
-                                    continue
+                                if subscriber_kind == "orchestrator":
+                                    # Orchestrator subtree subs care about their
+                                    # CHILDREN's terminal events, not the root's
+                                    # own (the root never emits blocked/completed
+                                    # — a child does), so the root-only claim
+                                    # above is always empty for them (event-hub
+                                    # F12). Gate on a NON-ADVANCING peek of the
+                                    # subtree instead; the OrchestratorDelivery-
+                                    # Adapter is the SOLE owner of the subtree
+                                    # cursor (its internal
+                                    # claim_unseen_subtree_events_for_sub is the
+                                    # one authoritative claimer that advances it).
+                                    # The watcher only peeks here — never claims —
+                                    # so the single-claimer invariant can't be
+                                    # broken from a distance.
+                                    if not _kb.subtree_has_unseen_events_for_sub(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                    ):
+                                        continue
+                                    # No watcher-side cursor to advance: the
+                                    # adapter advances the subtree cursor itself
+                                    # on a successful claim. The post-deliver
+                                    # advance is skipped for this kind (below),
+                                    # so these placeholder cursor values are
+                                    # never written back.
+                                    old_cursor = cursor = 0
+                                    events = []
+                                else:
+                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                        kinds=TERMINAL_KINDS,
+                                    )
+                                    if not events:
+                                        continue
                                 task = _kb.get_task(conn, sub["task_id"])
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
@@ -367,9 +399,19 @@ class GatewayKanbanWatchersMixin:
                         # All events delivered; advance cursor. The cursor
                         # is the dedup mechanism — it prevents re-delivery
                         # of the same event on subsequent ticks.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
+                        #
+                        # Orchestrator subtree subs are the ONE exception: the
+                        # adapter is the sole owner of the subtree cursor (it
+                        # advanced it inside its own claim during deliver), and
+                        # the watcher only peeked (no claim, no real cursor). An
+                        # unconditional advance here would write the stale peeked
+                        # value back and clobber/rewind the adapter's claim,
+                        # breaking dedup — so skip it for this kind (event-hub
+                        # F12).
+                        if subscriber_kind != "orchestrator":
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
                         # Unsubscribe only when the task has reached a truly
                         # final status (done / archived). For blocked /
                         # gave_up / crashed / timed_out the subscription is
