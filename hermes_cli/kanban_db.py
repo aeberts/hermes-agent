@@ -9390,6 +9390,59 @@ def drain_notices(
     return [dict(r) for r in rows]
 
 
+def drain_session_notices(
+    *, subscriber_kind: str = "orchestrator",
+) -> list[dict]:
+    """One-shot drain of ``subscriber_kind`` notices across EVERY board.
+
+    The live-wake surfacing primitive (event-hub M01): an interactive CLI/TUI
+    session is one process per session, so every ``orchestrator`` (or ``cli``)
+    notice in the shared store belongs to *this* session — the same
+    single-session-per-process assumption the background-process notification
+    queue and the TUI notifier poller already make. Enumerates boards the same
+    way the gateway notifier watcher does (so a notice produced on whatever board
+    the orchestrator supervised — even an ad-hoc one — is found), draining each
+    resolved DB path once. Each returned dict carries its source ``board`` slug;
+    the underlying :func:`drain_notices` DELETEs the rows, so a notice is
+    surfaced exactly once.
+
+    This is a pure read-once DB drain — it never touches a running turn. The
+    caller (the CLI ``process_loop`` idle tick / post-turn boundary; the TUI
+    poller) decides when it is safe to surface, so there is no mid-turn injection.
+    """
+    drained: list[dict] = []
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        boards = [read_board_metadata(DEFAULT_BOARD)]
+    seen_db_paths: set[str] = set()
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        db_path = meta.get("db_path")
+        try:
+            resolved = (
+                str(Path(db_path).expanduser().resolve()) if db_path
+                else str(kanban_db_path(slug).resolve())
+            )
+        except Exception:
+            resolved = f"slug:{slug}"
+        if resolved in seen_db_paths:
+            continue
+        seen_db_paths.add(resolved)
+        try:
+            conn = connect(board=slug)
+        except Exception:
+            continue
+        try:
+            rows = drain_notices(conn, subscriber_kind=subscriber_kind)
+            for r in rows:
+                r.setdefault("board", slug)
+            drained.extend(rows)
+        finally:
+            conn.close()
+    return drained
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator re-engagement (event-hub F09) — close-the-loop handoff
 # ---------------------------------------------------------------------------

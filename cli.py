@@ -10039,6 +10039,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception as e:
             print(f"  Error generating insights: {e}")
 
+    def _drain_kanban_live_notices(self, *, force: bool = False) -> None:
+        """M01: surface kanban supervision notices into the idle REPL.
+
+        Drains the shared ``kanban_notices`` store (the orchestrator
+        subscriptions written by ``kanban_subscribe`` + the gateway notifier)
+        one-shot and queues a re-engage message onto ``_pending_input`` so the
+        supervising orchestrator wakes on the NEXT turn — the exact safe boundary
+        the background-process notifications already use (see process_loop). It
+        NEVER runs mid-turn: the idle caller gates on ``not self._agent_running``
+        and the post-turn caller fires at the turn boundary; the queued message
+        rides the same ``_pending_input`` FIFO as user input, so real input
+        preempts. The drain is read-once (it DELETEs the rows), so a notice
+        surfaces exactly once.
+
+        Throttled so the 0.1s idle loop doesn't hammer the board DB; the
+        post-turn boundary passes ``force=True`` so a notice that landed during
+        the turn surfaces the moment it ends.
+        """
+        KANBAN_NOTICE_INTERVAL = 4.0  # seconds between board-DB drains on the idle loop
+        now = time.monotonic()
+        if not force and now - getattr(self, "_last_kanban_notice_check", 0.0) < KANBAN_NOTICE_INTERVAL:
+            return
+        self._last_kanban_notice_check = now
+        try:
+            from hermes_cli import kanban_db as _kb
+            notices = _kb.drain_session_notices(subscriber_kind="orchestrator")
+        except Exception:
+            return
+        for n in notices:
+            msg = (n.get("message") or "").strip()
+            if not msg:
+                continue
+            synth = (
+                f"[kanban] Supervision update — {msg}\n"
+                "(You are supervising this goal. Look at the board for this task and take "
+                "the single next step: surface to me any decision the team needs, "
+                "triage/unblock a blocked card, or tell me the goal is complete. Do NOT "
+                "start a polling loop.)"
+            )
+            try:
+                self._pending_input.put(synth)
+            except Exception:
+                pass
+
     def _check_config_mcp_changes(self) -> None:
         """Detect mcp_servers changes in config.yaml and auto-reload MCP connections.
 
@@ -14657,6 +14701,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                     self._pending_input.put(_synth)
                             except Exception:
                                 pass
+                            # M01: surface kanban supervision notices live (idle
+                            # boundary, throttled). Re-engages the orchestrator on
+                            # the next turn; user input still preempts via the queue.
+                            try:
+                                self._drain_kanban_live_notices()
+                            except Exception:
+                                pass
                         continue
                     
                     if not user_input:
@@ -14810,6 +14861,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                 self._pending_input.put(_synth)
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
+
+                        # M01: at the turn boundary, surface any kanban supervision
+                        # notice that landed during the turn (force past the idle
+                        # throttle — this fires once per turn end, never mid-turn).
+                        try:
+                            self._drain_kanban_live_notices(force=True)
+                        except Exception:
+                            pass
 
                 except Exception as e:
                     logger.warning("process_loop unhandled error (msg may be lost): %s", e)
