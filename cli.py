@@ -10116,14 +10116,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """Classify a supervision notice for M01 debounce.
 
         Reads the F07 aggregate-snapshot ``payload`` and returns a hashable
-        signature ``(actionable, fan_in_or_done, blocked_ids, done, total)``,
-        where ``actionable`` is true when there is a blocked child, the subtree
-        is fan-in ready, or every subtask is done — the only states with a next
-        step for the supervisor. The remaining fields make the signature change
+        signature ``(actionable, root_terminal, fan_in_or_done, blocked_ids,
+        done, total)``, where ``actionable`` is true when there is a blocked
+        child, the subtree is fan-in ready, every subtask is done, or the root
+        itself has reached a terminal status — the only states with a next step
+        for the supervisor. The remaining fields make the signature change
         whenever the actionable state itself changes (a new blocker, fan-in
-        flipping true), so a genuinely new situation always re-wakes while a
-        repeat of the same state does not. Returns ``None`` when the payload is
-        absent or unparseable, signalling the caller to surface unconditionally.
+        flipping true, the root completing), so a genuinely new situation always
+        re-wakes while a repeat of the same state does not.
+
+        ``root_terminal`` is the load-bearing field for the final wake: the
+        subtree closure includes the root node, so the root's own ``completed``
+        event fires one last supervision notice — but its children + fan_in_ready
+        are computed purely over the subtasks and so are byte-identical to the
+        earlier fan-in-ready notice. Only the root's status distinguishes "goal
+        complete" from "fan-in ready"; without it the dedup would swallow the
+        completion wake. Returns ``None`` when the payload is absent or
+        unparseable, signalling the caller to surface unconditionally.
         """
         raw = notice.get("payload")
         if not raw:
@@ -10140,8 +10149,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         total = len(children)
         fan_in = bool(snap.get("fan_in_ready"))
         all_done = total > 0 and done == total
-        actionable = bool(blocked or fan_in or all_done)
-        return (actionable, fan_in or all_done, blocked, done, total)
+        root_terminal = snap.get("root_status") in ("done", "archived")
+        actionable = bool(blocked or fan_in or all_done or root_terminal)
+        return (actionable, root_terminal, fan_in or all_done, blocked, done, total)
 
     def _check_config_mcp_changes(self) -> None:
         """Detect mcp_servers changes in config.yaml and auto-reload MCP connections.

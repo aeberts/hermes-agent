@@ -17,11 +17,12 @@ def _add(conn, kind, target, tid, msg, subkind="orchestrator", payload=None):
     )
 
 
-def _snapshot(parent_id, children, *, fan_in_ready=False):
+def _snapshot(parent_id, children, *, fan_in_ready=False, root_status=None):
     """Build an F07-shaped supervision payload (the orchestrator adapter's JSON)."""
     return json.dumps({
         "schema": 1, "parent_id": parent_id, "board": "default",
-        "fan_in_ready": fan_in_ready, "children": list(children),
+        "fan_in_ready": fan_in_ready, "root_status": root_status,
+        "children": list(children),
     })
 
 
@@ -209,3 +210,63 @@ def test_cli_drain_coalesces_to_freshest_per_root(tmp_path, monkeypatch):
     assert stub._pending_input.qsize() == 1
     msg = stub._pending_input.get_nowait()
     assert "fan-in ready" in msg
+
+
+def test_cli_drain_completion_wakes_even_after_fan_in(tmp_path, monkeypatch):
+    """Regression: the root's own completion must surface as a final wake.
+
+    The subtree closure includes the root node, so the root's `completed` event
+    fires one last supervision notice — but its children + fan_in_ready are
+    computed purely over the subtasks and so are byte-identical to the earlier
+    fan-in-ready notice. Without the root_status field in the signature the
+    debounce dedup swallowed this completion wake (observed live: board m01_1,
+    root t_5ea6bf3d completed but the supervisor was never re-engaged).
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+
+    from cli import HermesCLI
+    stub = HermesCLI.__new__(HermesCLI)
+    stub._pending_input = queue.Queue()
+
+    children = [
+        {"task_id": "c1", "kind": "completed"},
+        {"task_id": "c2", "kind": "completed"},
+    ]
+
+    # 1) fan-in ready (root still `ready`, not yet worked) → surfaces
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — fan-in ready — 2 done",
+             payload=_snapshot("t_1", children, fan_in_ready=True, root_status="ready"))
+    finally:
+        conn.close()
+    HermesCLI._drain_kanban_live_notices(stub, force=True)
+    assert stub._pending_input.qsize() == 1
+    stub._pending_input.get_nowait()
+
+    # 2) root now done — SAME children, SAME fan_in_ready, only root_status flips.
+    #    Must still surface (goal-complete is a distinct, actionable state).
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — goal complete — 2 done",
+             payload=_snapshot("t_1", children, fan_in_ready=True, root_status="done"))
+    finally:
+        conn.close()
+    HermesCLI._drain_kanban_live_notices(stub, force=True)
+    assert stub._pending_input.qsize() == 1, "root completion must wake the supervisor"
+    msg = stub._pending_input.get_nowait()
+    assert "goal complete" in msg
+
+    # 3) a duplicate completion notice → deduped (no second wake)
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — goal complete — 2 done",
+             payload=_snapshot("t_1", children, fan_in_ready=True, root_status="done"))
+    finally:
+        conn.close()
+    HermesCLI._drain_kanban_live_notices(stub, force=True)
+    assert stub._pending_input.qsize() == 0

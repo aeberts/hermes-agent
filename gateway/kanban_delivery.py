@@ -424,6 +424,8 @@ class OrchestratorDeliveryAdapter:
 
         children = _kb.parent_ids(conn, root_id)
         fan_in_ready = _kb.subtree_fan_in_ready(conn, root_id)
+        root_task = _kb.get_task(conn, root_id)
+        root_status = root_task.status if root_task else None
         rows: list[dict] = []
         for cid in children:
             task = _kb.get_task(conn, cid)
@@ -462,6 +464,15 @@ class OrchestratorDeliveryAdapter:
             "parent_id": root_id,
             "board": board_slug or "default",
             "fan_in_ready": fan_in_ready,
+            # The root's OWN status. The subtree closure includes the root node
+            # (kanban_db._subtree_closure_ids), so the root's own `completed`
+            # event triggers a final supervision notice. ``fan_in_ready`` and the
+            # children rows are computed purely over the subtasks, so they look
+            # identical at fan-in and at root-completion — only ``root_status``
+            # distinguishes "goal complete" from "fan-in ready", which the M01
+            # live-wake debounce relies on to surface the final wake instead of
+            # deduping it against the earlier fan-in notice.
+            "root_status": root_status,
             "children": rows,
         }
 
@@ -471,8 +482,14 @@ class OrchestratorDeliveryAdapter:
         children = snapshot.get("children", [])
         done = sum(1 for c in children if c.get("kind") == "completed")
         blocked = [c for c in children if c.get("kind") == "blocked"]
+        root_done = snapshot.get("root_status") in ("done", "archived")
         parts = [f"Kanban {snapshot['parent_id']} supervision"]
-        if snapshot.get("fan_in_ready"):
+        # The root reaching a terminal status is the goal-complete signal — say
+        # so plainly rather than reusing the children-only "fan-in ready" phrasing
+        # (which reads identically at the fan-in and completion moments).
+        if root_done:
+            parts.append("goal complete")
+        elif snapshot.get("fan_in_ready"):
             parts.append("fan-in ready")
         counts = f"{done} done"
         if blocked:

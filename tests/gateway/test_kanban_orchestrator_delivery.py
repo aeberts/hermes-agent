@@ -207,6 +207,51 @@ def test_fan_in_ready_once_then_cursor_dedups(kanban_home):
     assert _drain("orch-2") == [], "no duplicate notice on re-claim"
 
 
+def test_root_completion_snapshot_carries_root_status_and_goal_complete(kanban_home):
+    """The root's OWN completion fires a final notice tagged root_status=done.
+
+    The subtree closure includes the root node, so when the root itself reaches
+    `done` a last supervision notice is written. Its children + fan_in_ready are
+    identical to the earlier fan-in notice, so the snapshot must carry
+    ``root_status`` (and the message say "goal complete") for the M01 live-wake
+    debounce to tell the two apart and surface the final wake.
+    """
+    parent = _create("root")
+    child = _create("child")
+    sub = _subscribe_orchestrator(parent, "orch-rootdone")
+
+    conn = kb.connect()
+    try:
+        _link(conn, parent, child)
+        _complete(conn, child, summary="child done")
+    finally:
+        conn.close()
+
+    # fan-in notice: root still pending, not yet terminal.
+    _deliver(sub)
+    fan_in = _drain("orch-rootdone")
+    assert len(fan_in) == 1
+    fi_payload = json.loads(fan_in[0]["payload"])
+    assert fi_payload["fan_in_ready"] is True
+    assert fi_payload["root_status"] not in ("done", "archived")
+    assert "goal complete" not in fan_in[0]["message"]
+
+    # Now drive the ROOT itself terminal (its subtask is done, so it's completable).
+    conn = kb.connect()
+    try:
+        _complete(conn, parent, summary="goal brief")
+    finally:
+        conn.close()
+
+    _deliver(sub)
+    done = _drain("orch-rootdone")
+    assert len(done) == 1, "root's own completion fires a final supervision notice"
+    payload = json.loads(done[0]["payload"])
+    assert payload["root_status"] == "done"
+    assert payload["fan_in_ready"] is True  # children unchanged → identical but-for root_status
+    assert "goal complete" in done[0]["message"]
+
+
 def test_non_terminal_events_ignored(kanban_home):
     """A non-terminal child event alone produces no supervision notice."""
     parent = _create("root")
