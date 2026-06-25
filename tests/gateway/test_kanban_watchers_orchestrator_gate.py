@@ -61,6 +61,20 @@ def _make_runner(adapter):
     return runner
 
 
+def _make_runner_no_platform():
+    """A runner with NO connected messaging platform (``self.adapters == {}``).
+
+    This is the Mini's live posture (Telegram deferred → "No messaging
+    platforms enabled"). Before F14 ``_collect`` early-returned the whole tick
+    for this, stranding every surface-agnostic (orchestrator/cli/tui) sub.
+    """
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    return runner
+
+
 def _subscribe_orchestrator(parent_id: str, target_id: str) -> None:
     conn = kb.connect()
     try:
@@ -86,6 +100,29 @@ def _drain_orchestrator(target_id: str) -> list[dict]:
         return kb.drain_notices(
             conn, subscriber_kind="orchestrator", target_id=target_id,
         )
+    finally:
+        conn.close()
+
+
+def _subscribe_cli(task_id: str, target_id: str) -> None:
+    """A surface-agnostic cli sub (F04 convention: platform=kind, chat_id=target)."""
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="cli",
+            chat_id=target_id,
+            subscriber_kind="cli",
+        )
+    finally:
+        conn.close()
+
+
+def _drain_cli(target_id: str) -> list[dict]:
+    conn = kb.connect()
+    try:
+        return kb.drain_notices(conn, subscriber_kind="cli", target_id=target_id)
     finally:
         conn.close()
 
@@ -241,3 +278,119 @@ def test_task_scoped_gateway_sub_unaffected_in_same_board(tmp_path, monkeypatch)
     assert own in adapter.sent[0]["text"]
     # The orchestrator sub delivered its child notice through the notice queue.
     assert len(_drain_orchestrator("orch-watch-4")) == 1
+
+
+# ---------------------------------------------------------------------------
+# F14 — the notifier tick must run even with NO connected messaging platform.
+#
+# Before F14, ``_collect`` early-returned the whole tick when
+# ``self.adapters == {}``, so on any host with no Discord/Telegram/Slack (the
+# Mini, where Telegram is deferred) NO notifier-produced notice was ever
+# delivered live — orchestrator/cli/tui subs were stranded even though they
+# need no Platform. These pin that surface-agnostic delivery still happens with
+# an empty adapter map, and that the per-sub gateway gate remains the
+# authoritative connectivity filter (a gateway sub with no adapter is STILL
+# skipped — the regression guard).
+# ---------------------------------------------------------------------------
+
+
+def test_watcher_delivers_orchestrator_subtree_with_no_platform(tmp_path, monkeypatch):
+    """No messaging platform + orchestrator subtree sub + completed child →
+    deliver() is still reached and a supervision notice is written (F14)."""
+    db_path = tmp_path / "f14-orch-noplatform.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root goal", assignee="orchestrator")
+        child = kb.create_task(conn, title="child A", assignee="worker")
+        kb.link_tasks(conn, child, parent)
+        kb.complete_task(conn, child, summary="child A done")
+    finally:
+        conn.close()
+
+    _subscribe_orchestrator(parent, "f14-orch-1")
+
+    # No connected messaging Platform — the Mini's live posture.
+    runner = _make_runner_no_platform()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    notices = _drain_orchestrator("f14-orch-1")
+    assert len(notices) == 1, (
+        "with self.adapters == {} the tick must STILL enumerate subs and reach "
+        "OrchestratorDeliveryAdapter.deliver() — surface-agnostic delivery (F14)"
+    )
+    assert notices[0]["task_id"] == parent
+    assert notices[0]["kind"] == "supervision"
+    # The subtree cursor advanced (the adapter claimed), proving the sub was
+    # actually evaluated, not silently skipped.
+    assert _sub_cursor(parent) > 0
+
+
+def test_watcher_delivers_cli_sub_with_no_platform(tmp_path, monkeypatch):
+    """No messaging platform + cli sub + completed task → a cli notice is
+    persisted through the cli adapter (F14)."""
+    db_path = tmp_path / "f14-cli-noplatform.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="cli task", assignee="worker")
+        kb.complete_task(conn, task, summary="cli done")
+    finally:
+        conn.close()
+
+    _subscribe_cli(task, "f14-cli-1")
+
+    runner = _make_runner_no_platform()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    notices = _drain_cli("f14-cli-1")
+    assert len(notices) == 1, (
+        "a cli sub must deliver a notice with no connected messaging platform (F14)"
+    )
+    assert notices[0]["task_id"] == task
+    assert notices[0]["kind"] == "completed"
+
+
+def test_watcher_gateway_sub_still_skipped_with_no_platform(tmp_path, monkeypatch):
+    """REGRESSION: a gateway sub whose platform is NOT in active_platforms
+    (self.adapters == {}) is STILL skipped — no notice, no crash. The per-sub
+    gate remains the authoritative connectivity filter (F14)."""
+    db_path = tmp_path / "f14-gw-noplatform.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        # A cli sub that SHOULD deliver alongside ...
+        cli_task = kb.create_task(conn, title="cli task", assignee="worker")
+        kb.complete_task(conn, cli_task, summary="cli done")
+        # ... a gateway (telegram) sub that must STILL be skipped with no adapter.
+        gw_task = kb.create_task(conn, title="gw task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=gw_task, platform="telegram", chat_id="chat-x")
+        kb.complete_task(conn, gw_task, summary="gw done")
+        gw_subs = kb.list_notify_subs(conn, gw_task)
+    finally:
+        conn.close()
+
+    _subscribe_cli(cli_task, "f14-gw-1")
+
+    runner = _make_runner_no_platform()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # The surface-agnostic cli sub delivered ...
+    assert len(_drain_cli("f14-gw-1")) == 1
+    # ... but the gateway sub was skipped: its cursor never advanced (no claim).
+    assert int(gw_subs[0]["last_event_id"]) == 0
+    conn = kb.connect()
+    try:
+        after = kb.list_notify_subs(conn, gw_task)
+    finally:
+        conn.close()
+    assert int(after[0]["last_event_id"]) == 0, (
+        "a gateway sub with no connected adapter must STILL be skipped at the "
+        "per-sub gate — the tick-level removal must not let it deliver (F14)"
+    )

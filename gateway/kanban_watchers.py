@@ -199,9 +199,17 @@ class GatewayKanbanWatchersMixin:
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
-                    if not active_platforms:
-                        logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                    # Do NOT bail the tick when no messaging platform is
+                    # connected (``self.adapters == {}``) — orchestrator/cli/tui
+                    # subs are surface-agnostic and deliver through their own
+                    # registered adapter with no Platform. The per-sub gateway
+                    # gate below (``subscriber_kind == 'gateway' and platform not
+                    # in active_platforms``) is the authoritative connectivity
+                    # filter, so the only kind that needs a connected platform is
+                    # already skipped there (and again at adapter-resolution).
+                    # A tick-level early-return here would strand every
+                    # non-gateway sub on any host with no messaging platform
+                    # (event-hub F14).
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
