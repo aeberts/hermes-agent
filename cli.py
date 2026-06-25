@@ -10056,6 +10056,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         Throttled so the 0.1s idle loop doesn't hammer the board DB; the
         post-turn boundary passes ``force=True`` so a notice that landed during
         the turn surfaces the moment it ends.
+
+        Debounce (M01 refinement): the F07 adapter writes one supervision notice
+        per subtree event, so a multi-subtask goal emits a notice on every
+        intermediate completion — most carrying nothing the supervisor can act
+        on. To avoid spending a turn on each, the drain (1) **coalesces** to the
+        freshest notice per supervised root (earlier snapshots are superseded)
+        and (2) surfaces a wake only for an **actionable** state — a blocked
+        child, fan-in ready, or all subtasks done — and only when that state
+        *differs* from the last one surfaced for that root (kills duplicate
+        re-wakes for an unchanged state). Pure-progress snapshots ("2 done, 0
+        blocked, not yet fan-in") leave the orchestrator idle, since there is no
+        next step to take. A notice whose payload can't be classified is always
+        surfaced — an unclassifiable notice is never silently dropped.
         """
         KANBAN_NOTICE_INTERVAL = 4.0  # seconds between board-DB drains on the idle loop
         now = time.monotonic()
@@ -10067,10 +10080,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             notices = _kb.drain_session_notices(subscriber_kind="orchestrator")
         except Exception:
             return
+        # Coalesce: keep only the freshest notice per supervised root. The drain
+        # returns rows oldest-first, so the last write per task_id wins.
+        latest_by_root: "dict[str, dict]" = {}
         for n in notices:
+            latest_by_root[n.get("task_id") or ""] = n
+        last_surfaced = getattr(self, "_kanban_last_surfaced", None)
+        if last_surfaced is None:
+            last_surfaced = self._kanban_last_surfaced = {}
+        for root_id, n in latest_by_root.items():
             msg = (n.get("message") or "").strip()
             if not msg:
                 continue
+            sig = self._kanban_notice_signature(n)
+            if sig is not None:
+                if not sig[0]:
+                    continue  # not actionable — nothing for the supervisor to do
+                if last_surfaced.get(root_id) == sig:
+                    continue  # same actionable state already surfaced
+                last_surfaced[root_id] = sig
             synth = (
                 f"[kanban] Supervision update — {msg}\n"
                 "(You are supervising this goal. Look at the board for this task and take "
@@ -10082,6 +10110,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._pending_input.put(synth)
             except Exception:
                 pass
+
+    @staticmethod
+    def _kanban_notice_signature(notice: dict):
+        """Classify a supervision notice for M01 debounce.
+
+        Reads the F07 aggregate-snapshot ``payload`` and returns a hashable
+        signature ``(actionable, fan_in_or_done, blocked_ids, done, total)``,
+        where ``actionable`` is true when there is a blocked child, the subtree
+        is fan-in ready, or every subtask is done — the only states with a next
+        step for the supervisor. The remaining fields make the signature change
+        whenever the actionable state itself changes (a new blocker, fan-in
+        flipping true), so a genuinely new situation always re-wakes while a
+        repeat of the same state does not. Returns ``None`` when the payload is
+        absent or unparseable, signalling the caller to surface unconditionally.
+        """
+        raw = notice.get("payload")
+        if not raw:
+            return None
+        try:
+            snap = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        children = snap.get("children") or []
+        blocked = frozenset(
+            c.get("task_id") for c in children if c.get("kind") == "blocked"
+        )
+        done = sum(1 for c in children if c.get("kind") == "completed")
+        total = len(children)
+        fan_in = bool(snap.get("fan_in_ready"))
+        all_done = total > 0 and done == total
+        actionable = bool(blocked or fan_in or all_done)
+        return (actionable, fan_in or all_done, blocked, done, total)
 
     def _check_config_mcp_changes(self) -> None:
         """Detect mcp_servers changes in config.yaml and auto-reload MCP connections.

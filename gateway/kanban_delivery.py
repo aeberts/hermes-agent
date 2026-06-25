@@ -301,7 +301,16 @@ def _truncate_line(text: Optional[str], limit: int = 200) -> Optional[str]:
     if not s:
         return None
     line = s.splitlines()[0]
-    return line[:limit]
+    if len(line) <= limit:
+        return line
+    # Break on the last word boundary inside the budget (falling back to a hard
+    # cut for a single over-long token) and mark the elision, so a notice never
+    # ends mid-word like "…SMS can be mob".
+    head = line[:limit]
+    cut = head.rfind(" ")
+    if cut >= limit // 2:
+        head = head[:cut]
+    return head.rstrip() + "…"
 
 
 class OrchestratorDeliveryAdapter:

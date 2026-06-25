@@ -4,16 +4,25 @@ Covers the DB drain primitive (`drain_session_notices`) and the CLI
 `_drain_kanban_live_notices` boundary helper that queues a re-engage message onto
 `_pending_input` (never mid-turn; the callers in `process_loop` own that gating).
 """
+import json
 import queue
 
 from hermes_cli import kanban_db as kb
 
 
-def _add(conn, kind, target, tid, msg, subkind="orchestrator"):
+def _add(conn, kind, target, tid, msg, subkind="orchestrator", payload=None):
     kb.add_notice(
         conn, subscriber_kind=subkind, target_id=target,
-        task_id=tid, kind=kind, message=msg,
+        task_id=tid, kind=kind, message=msg, payload=payload,
     )
+
+
+def _snapshot(parent_id, children, *, fan_in_ready=False):
+    """Build an F07-shaped supervision payload (the orchestrator adapter's JSON)."""
+    return json.dumps({
+        "schema": 1, "parent_id": parent_id, "board": "default",
+        "fan_in_ready": fan_in_ready, "children": list(children),
+    })
 
 
 def test_drain_session_notices_one_shot_and_kind_filtered(tmp_path, monkeypatch):
@@ -88,3 +97,115 @@ def test_cli_drain_throttled_but_force_bypasses(monkeypatch):
     assert calls["n"] == 1
     HermesCLI._drain_kanban_live_notices(stub, force=True)  # post-turn force: runs
     assert calls["n"] == 2
+
+
+def test_signature_classifies_actionable_vs_progress():
+    from cli import HermesCLI
+
+    sig = HermesCLI._kanban_notice_signature
+    # pure progress: 1 of 2 done, nothing blocked, not fan-in → NOT actionable
+    progress = {"payload": _snapshot("t_1", [
+        {"task_id": "c1", "kind": "completed"},
+        {"task_id": "c2", "kind": None},
+    ])}
+    assert sig(progress)[0] is False
+    # a blocked child → actionable
+    blocked = {"payload": _snapshot("t_1", [
+        {"task_id": "c1", "kind": "completed"},
+        {"task_id": "c2", "kind": "blocked"},
+    ])}
+    assert sig(blocked)[0] is True
+    # fan-in ready → actionable
+    fan_in = {"payload": _snapshot("t_1", [
+        {"task_id": "c1", "kind": "completed"},
+    ], fan_in_ready=True)}
+    assert sig(fan_in)[0] is True
+    # all subtasks done → actionable (effective completion)
+    all_done = {"payload": _snapshot("t_1", [
+        {"task_id": "c1", "kind": "completed"},
+        {"task_id": "c2", "kind": "completed"},
+    ])}
+    assert sig(all_done)[0] is True
+    # no/garbage payload → None (caller surfaces unconditionally)
+    assert sig({"payload": None}) is None
+    assert sig({"payload": "{not json"}) is None
+
+
+def test_cli_drain_suppresses_progress_and_duplicates(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+
+    from cli import HermesCLI
+    stub = HermesCLI.__new__(HermesCLI)
+    stub._pending_input = queue.Queue()
+
+    # 1) pure-progress snapshot → suppressed (no turn spent)
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — 1 done", payload=_snapshot("t_1", [
+                 {"task_id": "c1", "kind": "completed"},
+                 {"task_id": "c2", "kind": None},
+             ]))
+    finally:
+        conn.close()
+    HermesCLI._drain_kanban_live_notices(stub, force=True)
+    assert stub._pending_input.qsize() == 0
+
+    # 2) a blocked child → surfaces exactly one re-engage
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — 1 done, 1 blocked", payload=_snapshot("t_1", [
+                 {"task_id": "c1", "kind": "completed"},
+                 {"task_id": "c2", "kind": "blocked"},
+             ]))
+    finally:
+        conn.close()
+    HermesCLI._drain_kanban_live_notices(stub, force=True)
+    assert stub._pending_input.qsize() == 1
+    stub._pending_input.get_nowait()
+
+    # 3) the SAME blocked state again → suppressed as a duplicate re-wake
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — 1 done, 1 blocked", payload=_snapshot("t_1", [
+                 {"task_id": "c1", "kind": "completed"},
+                 {"task_id": "c2", "kind": "blocked"},
+             ]))
+    finally:
+        conn.close()
+    HermesCLI._drain_kanban_live_notices(stub, force=True)
+    assert stub._pending_input.qsize() == 0
+
+
+def test_cli_drain_coalesces_to_freshest_per_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+
+    from cli import HermesCLI
+    stub = HermesCLI.__new__(HermesCLI)
+    stub._pending_input = queue.Queue()
+
+    # Two notices for the SAME root land in one drain window: an intermediate
+    # progress snapshot, then a fan-in snapshot. Only the freshest (fan-in,
+    # actionable) survives coalescing → exactly one wake, carrying fan-in.
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — 1 done", payload=_snapshot("t_1", [
+                 {"task_id": "c1", "kind": "completed"},
+                 {"task_id": "c2", "kind": None},
+             ]))
+        _add(conn, "supervision", "orch:t_1", "t_1",
+             "Kanban t_1 supervision — fan-in ready — 2 done", payload=_snapshot("t_1", [
+                 {"task_id": "c1", "kind": "completed"},
+                 {"task_id": "c2", "kind": "completed"},
+             ], fan_in_ready=True))
+    finally:
+        conn.close()
+    HermesCLI._drain_kanban_live_notices(stub, force=True)
+    assert stub._pending_input.qsize() == 1
+    msg = stub._pending_input.get_nowait()
+    assert "fan-in ready" in msg
