@@ -67,8 +67,8 @@ def _make_root_with_child(conn, *, assignee: str = "worker"):
     return root, child
 
 
-def _block(conn, child: str, *, reason: str = "needs a decision") -> None:
-    assert kb.block_task(conn, child, reason=reason) is True
+def _block(conn, child: str, *, reason: str = "needs a decision", kind=None) -> None:
+    assert kb.block_task(conn, child, reason=reason, kind=kind) is True
 
 
 class _RecordingSpawn:
@@ -280,13 +280,20 @@ def test_breaker_parks_after_limit_and_resets_on_reblock(kanban_home, monkeypatc
         # Resolution + re-block: unblock then re-block writes a NEW blocked
         # event with a newer timestamp, so the old episode's runs drop out of
         # the breaker count → it resets and a fresh wake fires.
+        #
+        # The re-block uses a DIFFERENT block kind (a genuinely new blocker).
+        # Upstream's block-loop detector (``BLOCK_RECURRENCE_LIMIT``) routes a
+        # SAME-kind re-block-after-unblock to ``triage`` (writing a
+        # ``block_loop_detected`` event, not ``blocked``), so the supervisor
+        # breaker's episode reset is reached via a distinct new blocker — which
+        # is the scenario that still produces a fresh ``blocked`` event.
         assert kb.unblock_task(conn, child) is True
         # Re-claim into running so block_task's running->blocked guard passes.
         conn.execute(
             "UPDATE tasks SET status = 'running' WHERE id = ?", (child,),
         )
         conn.commit()
-        _block(conn, child, reason="re-blocked anew")
+        _block(conn, child, reason="re-blocked anew", kind="needs_input")
 
         stub2 = _RecordingSpawn()
         res2 = kb.dispatch_once(conn, supervisor_spawn_fn=stub2)
