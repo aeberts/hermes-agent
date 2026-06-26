@@ -53,6 +53,34 @@ def test_drain_session_notices_one_shot_and_kind_filtered(tmp_path, monkeypatch)
         conn.close()
 
 
+def test_drain_session_notices_task_ids_filter(tmp_path, monkeypatch):
+    """F15: task_ids scopes the drain so one session never eats another's notices."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_1", "t_1", "root 1 update")
+        _add(conn, "supervision", "orch:t_2", "t_2", "root 2 update")
+    finally:
+        conn.close()
+
+    # Drain only t_1's notices; t_2's survive.
+    drained = kb.drain_session_notices(subscriber_kind="orchestrator", task_ids={"t_1"})
+    assert [d["task_id"] for d in drained] == ["t_1"]
+    remaining = kb.drain_session_notices(subscriber_kind="orchestrator")
+    assert [d["task_id"] for d in remaining] == ["t_2"]
+
+    # An empty owned-set drains nothing (and leaves the store untouched).
+    conn = kb.connect()
+    try:
+        _add(conn, "supervision", "orch:t_3", "t_3", "root 3 update")
+    finally:
+        conn.close()
+    assert kb.drain_session_notices(subscriber_kind="orchestrator", task_ids=set()) == []
+    assert [d["task_id"] for d in
+            kb.drain_session_notices(subscriber_kind="orchestrator")] == ["t_3"]
+
+
 def test_cli_drain_queues_reengage_message(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()

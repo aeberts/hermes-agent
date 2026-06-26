@@ -9362,6 +9362,7 @@ def drain_notices(
     *,
     subscriber_kind: Optional[str] = None,
     target_id: Optional[str] = None,
+    task_ids: Optional[Iterable[str]] = None,
 ) -> list[dict]:
     """Return pending non-gateway notices and delete them (one-shot drain).
 
@@ -9370,7 +9371,20 @@ def drain_notices(
     its ``subscriber_kind``. ``subscriber_kind`` and/or ``target_id`` filter the
     drain; ``None`` for either means "all" on that axis, so draining one
     surface/target never consumes another's notices.
+
+    ``task_ids`` (event-hub F15) scopes the drain to notices whose ``task_id`` is
+    in the given set — the SELECT *and* the DELETE both honor it, so one caller
+    can drain only the roots it owns without consuming a sibling's notices (the
+    TUI runs several sessions in one process, each owning the roots it
+    subscribed). ``None`` means "all task ids" (the M01/CLI single-session
+    behavior); an empty iterable drains nothing.
     """
+    if task_ids is not None:
+        tid_list = list(task_ids)
+        if not tid_list:
+            return []
+    else:
+        tid_list = None
     where: list[str] = []
     params: list[object] = []
     if subscriber_kind is not None:
@@ -9379,6 +9393,9 @@ def drain_notices(
     if target_id is not None:
         where.append("target_id = ?")
         params.append(target_id)
+    if tid_list is not None:
+        where.append("task_id IN (" + ",".join("?" * len(tid_list)) + ")")
+        params.extend(tid_list)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     with write_txn(conn):
         rows = conn.execute(
@@ -9392,6 +9409,7 @@ def drain_notices(
 
 def drain_session_notices(
     *, subscriber_kind: str = "orchestrator",
+    task_ids: Optional[Iterable[str]] = None,
 ) -> list[dict]:
     """One-shot drain of ``subscriber_kind`` notices across EVERY board.
 
@@ -9406,10 +9424,20 @@ def drain_session_notices(
     the underlying :func:`drain_notices` DELETEs the rows, so a notice is
     surfaced exactly once.
 
+    ``task_ids`` (event-hub F15) narrows the drain to those root ids, so a TUI
+    session draining its OWN subscribed roots never consumes a sibling session's
+    notices (the single-process-per-session assumption above does not hold for
+    the TUI, which multiplexes sessions). ``None`` keeps the M01/CLI behavior
+    (drain all); an empty set drains nothing.
+
     This is a pure read-once DB drain — it never touches a running turn. The
     caller (the CLI ``process_loop`` idle tick / post-turn boundary; the TUI
     poller) decides when it is safe to surface, so there is no mid-turn injection.
     """
+    if task_ids is not None:
+        task_ids = list(task_ids)
+        if not task_ids:
+            return []
     drained: list[dict] = []
     try:
         boards = list_boards(include_archived=False)
@@ -9434,13 +9462,56 @@ def drain_session_notices(
         except Exception:
             continue
         try:
-            rows = drain_notices(conn, subscriber_kind=subscriber_kind)
+            rows = drain_notices(
+                conn, subscriber_kind=subscriber_kind, task_ids=task_ids,
+            )
             for r in rows:
                 r.setdefault("board", slug)
             drained.extend(rows)
         finally:
             conn.close()
     return drained
+
+
+def supervision_notice_signature(notice: dict):
+    """Classify an orchestrator supervision notice for live-wake debounce.
+
+    Shared by the CLI live-wake (M01, ``cli.HermesCLI._kanban_notice_signature``)
+    and the TUI live-wake (F15) so both surfaces debounce identically. Reads the
+    F07 aggregate-snapshot ``payload`` and returns a hashable signature
+    ``(actionable, root_terminal, fan_in_or_done, blocked_ids, done, total)``:
+    ``actionable`` is true when a child is blocked, the subtree is fan-in ready,
+    every subtask is done, or the root itself reached a terminal status — the
+    only states with a next step for the supervisor. The remaining fields make
+    the signature change whenever the actionable state itself changes (a new
+    blocker, fan-in flipping true, the root completing), so a genuinely new
+    situation always re-wakes while a repeat of the same state does not.
+
+    ``root_terminal`` is load-bearing for the final wake: the subtree closure
+    includes the root node, so the root's own ``completed`` event fires one last
+    supervision notice whose children + fan_in_ready are byte-identical to the
+    earlier fan-in notice — only the root's status distinguishes "goal complete"
+    from "fan-in ready". Returns ``None`` when the payload is absent or
+    unparseable (the caller then surfaces unconditionally — never silently drop).
+    """
+    raw = notice.get("payload")
+    if not raw:
+        return None
+    try:
+        snap = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    children = snap.get("children") or []
+    blocked = frozenset(
+        c.get("task_id") for c in children if c.get("kind") == "blocked"
+    )
+    done = sum(1 for c in children if c.get("kind") == "completed")
+    total = len(children)
+    fan_in = bool(snap.get("fan_in_ready"))
+    all_done = total > 0 and done == total
+    root_terminal = snap.get("root_status") in ("done", "archived")
+    actionable = bool(blocked or fan_in or all_done or root_terminal)
+    return (actionable, root_terminal, fan_in or all_done, blocked, done, total)
 
 
 # ---------------------------------------------------------------------------

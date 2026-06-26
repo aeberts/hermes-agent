@@ -3333,6 +3333,10 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
     payload = {"tool_id": tool_call_id, "name": name, "args": args}
     session = _sessions.get(sid)
+    # F15 (OQ-3 i): record which roots this session subscribed to, so the kanban
+    # live-wake poller only surfaces this session's own supervision notices.
+    if name == "kanban_subscribe" and session is not None:
+        _record_kanban_subscription(session, args, result)
     snapshot = None
     started_at = None
     if session is not None:
@@ -8240,6 +8244,146 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
+# Seconds between kanban board-DB drains on the poller tick (event-hub F15) —
+# mirrors the CLI M01 throttle (cli.HermesCLI KANBAN_NOTICE_INTERVAL).
+_KANBAN_NOTICE_INTERVAL = 4.0
+
+
+def _record_kanban_subscription(session: dict, args: dict, result: str) -> None:
+    """F15 (OQ-3 i): remember which roots THIS session subscribed to.
+
+    Called from `_on_tool_complete` when the agent runs `kanban_subscribe`. The
+    kanban supervision notice store is process-global and surface-agnostic, but a
+    TUI process multiplexes sessions — so a session must only surface notices for
+    goals IT is supervising. We record the subscribed root id here (in-memory, no
+    schema change) and `_drain_kanban_tui_notices` filters the drain to this set.
+    """
+    try:
+        tid = (args or {}).get("task_id")
+        if not tid:
+            return
+        ok = False
+        try:
+            data = json.loads(result)
+            ok = isinstance(data, dict) and (
+                data.get("subscription_id") is not None
+                or data.get("subscriber_kind") == "orchestrator"
+            )
+        except Exception:
+            ok = "subscription_id" in (result or "")
+        if ok:
+            session.setdefault("kanban_roots", set()).add(str(tid))
+    except Exception:
+        pass
+
+
+def _submit_kanban_turn(sid: str, session: dict, text: str) -> bool:
+    """Idle-gated re-engage turn for a kanban supervision notice (F15).
+
+    Mirrors the process-notification poller's idle gate: chains an agent turn via
+    `_run_prompt_submit` only when the session is idle. Returns True if the turn
+    was dispatched, False if the session was busy (caller stashes for retry).
+    """
+    with session["history_lock"]:
+        if session.get("running"):
+            return False
+        session["running"] = True
+    rid = f"__kanban__{int(time.time() * 1000)}"
+    try:
+        _emit("message.start", sid)
+        _run_prompt_submit(rid, sid, session, text)
+        return True
+    except Exception as exc:
+        print(
+            f"[tui_gateway] kanban notice dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        with session["history_lock"]:
+            session["running"] = False
+        return False
+
+
+def _drain_kanban_tui_notices(sid: str, session: dict) -> None:
+    """F15: surface kanban supervision notices into an idle TUI session.
+
+    The TUI parity of `cli.HermesCLI._drain_kanban_live_notices` (M01). Drains
+    only the orchestrator notices for the roots THIS session subscribed to
+    (OQ-3 i ownership, tracked in `session['kanban_roots']`), applies the shared
+    M01 debounce (`kanban_db.supervision_notice_signature`: coalesce per root;
+    surface only actionable + changed states), emits a `status.update` chip, and
+    chains a re-engage turn through the existing idle gate + `_run_prompt_submit`.
+
+    Only drains while the session is idle — the drain DELETEs, so draining
+    mid-turn would lose the wake (same idle-gate rationale as the CLI). Throttled
+    so the 0.5s poller tick doesn't hammer the board DB.
+    """
+    # Flush any re-engage text stashed when a prior tick raced into a turn.
+    pending = session.get("_kanban_pending")
+    if pending and not session.get("running"):
+        if _submit_kanban_turn(sid, session, pending[0]):
+            pending.pop(0)
+        return
+
+    roots = session.get("kanban_roots")
+    if not roots:
+        return
+    # Never drain mid-turn: the drain deletes and we cannot re-queue a deleted
+    # notice; notices accumulate in the store while busy and surface next idle.
+    if session.get("running"):
+        return
+    now = time.time()
+    if now - session.get("_kanban_last_check", 0.0) < _KANBAN_NOTICE_INTERVAL:
+        return
+    session["_kanban_last_check"] = now
+
+    try:
+        from hermes_cli import kanban_db as _kb
+        notices = _kb.drain_session_notices(
+            subscriber_kind="orchestrator", task_ids=set(roots),
+        )
+    except Exception:
+        return
+    if not notices:
+        return
+
+    # Coalesce to the freshest notice per root; keep only actionable + changed
+    # states. Combine into ONE re-engage turn so multiple roots don't fight over
+    # the one-turn-at-a-time session.
+    latest: dict = {}
+    for n in notices:
+        latest[n.get("task_id") or ""] = n
+    last_surfaced = session.setdefault("_kanban_last_surfaced", {})
+    lines: list[str] = []
+    for root_id, n in latest.items():
+        msg = (n.get("message") or "").strip()
+        if not msg:
+            continue
+        sig = _kb.supervision_notice_signature(n)
+        if sig is not None:
+            if not sig[0]:
+                continue
+            if last_surfaced.get(root_id) == sig:
+                continue
+            last_surfaced[root_id] = sig
+        lines.append(msg)
+    if not lines:
+        return
+
+    _emit("status.update", sid, {"kind": "kanban", "text": "; ".join(lines)})
+    text = (
+        "[kanban] Supervision update — " + "; ".join(lines) + "\n"
+        "(You are supervising this goal. Look at the board for this task and take "
+        "the single next step: surface to me any decision the team needs, "
+        "triage/unblock a blocked card, or tell me the goal is complete. Do NOT "
+        "start a polling loop.)"
+    )
+    if not _submit_kanban_turn(sid, session, text):
+        # Raced into a turn after the idle check; we already drained (deleted)
+        # the rows, so stash the text to surface on the next idle tick.
+        session.setdefault("_kanban_pending", []).append(text)
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -8258,6 +8402,16 @@ def _notification_poller_loop(
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     while not stop_event.is_set() and not session.get("_finalized"):
+        # F15: surface kanban supervision notices for this session's subscribed
+        # roots on the same tick (throttled; idle-gated inside). Isolated from the
+        # process-notification path below — never touches completion_queue.
+        try:
+            _drain_kanban_tui_notices(sid, session)
+        except Exception as exc:
+            print(
+                f"[tui_gateway] kanban drain failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
