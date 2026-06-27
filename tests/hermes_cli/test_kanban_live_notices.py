@@ -1,4 +1,4 @@
-"""M01 — live-wake surfacing of kanban supervision notices into the idle REPL.
+"""Live-wake surfacing of kanban supervision notices into the idle REPL.
 
 Covers the DB drain primitive (`drain_session_notices`) and the CLI
 `_drain_kanban_live_notices` boundary helper that queues a re-engage message onto
@@ -18,7 +18,7 @@ def _add(conn, kind, target, tid, msg, subkind="orchestrator", payload=None):
 
 
 def _snapshot(parent_id, children, *, fan_in_ready=False, root_status=None):
-    """Build an F07-shaped supervision payload (the orchestrator adapter's JSON)."""
+    """Build an orchestrator-supervision payload (the adapter's JSON shape)."""
     return json.dumps({
         "schema": 1, "parent_id": parent_id, "board": "default",
         "fan_in_ready": fan_in_ready, "root_status": root_status,
@@ -54,7 +54,7 @@ def test_drain_session_notices_one_shot_and_kind_filtered(tmp_path, monkeypatch)
 
 
 def test_drain_session_notices_task_ids_filter(tmp_path, monkeypatch):
-    """F15: task_ids scopes the drain so one session never eats another's notices."""
+    """task_ids scopes the drain so one session never eats another's notices."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()
     conn = kb.connect()
