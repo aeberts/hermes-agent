@@ -662,7 +662,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
 
 # ---------------------------------------------------------------------------
-# event-hub F04 — explicit subscribe primitive
+# explicit subscribe primitive
 #
 # A caller can declare a non-gateway subscriber (subscriber_kind + target)
 # explicitly instead of inferring identity from HERMES_SESSION_*. The gateway
@@ -756,7 +756,7 @@ def test_cli_subscribe_non_gateway_requires_target_id(kanban_home):
 
 def test_cli_subscribe_gateway_path_unchanged(kanban_home):
     """The default gateway flags still produce a gateway subscription with the
-    gateway-tuple target — identical to pre-F04 behavior."""
+    gateway-tuple target — identical to legacy behavior."""
     out = kc.run_slash("create 'gw sub' --assignee alice")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
@@ -764,7 +764,7 @@ def test_cli_subscribe_gateway_path_unchanged(kanban_home):
     out = kc.run_slash(
         f"notify-subscribe {tid} --platform telegram --chat-id chat1"
     )
-    # Confirmation message shows the real platform (pre-F04 behavior), not "gateway".
+    # Confirmation message shows the real platform (legacy behavior), not "gateway".
     assert "telegram:chat1" in out
 
     conn = kb.connect()
@@ -832,8 +832,8 @@ def test_notify_list_surfaces_subscriber_kind_and_target(kanban_home):
 
 
 def test_get_delivery_adapter_cli_registered(kanban_home):
-    """F05 registers the CLI delivery adapter for subscriber_kind='cli'.
-    (F04 left this None; F05 is what wires it.)"""
+    """Registers the CLI delivery adapter for subscriber_kind='cli'.
+    (The explicit-subscribe step left this None; the CLI adapter wires it.)"""
     from gateway.kanban_delivery import CLIDeliveryAdapter, get_delivery_adapter
     assert isinstance(get_delivery_adapter("cli"), CLIDeliveryAdapter)
     # gateway adapter still present.
@@ -842,8 +842,8 @@ def test_get_delivery_adapter_cli_registered(kanban_home):
 
 
 def test_notify_subscribe_scope_and_delivery_policy_flags(kanban_home):
-    """F07: additive --scope/--delivery-policy persist on the sub row;
-    defaults preserve the F04/F05/F06 behavior exactly."""
+    """Additive --scope/--delivery-policy persist on the sub row;
+    defaults preserve the gateway/cli/tui behavior exactly."""
     import re
     tid = re.search(
         r"(t_[a-f0-9]+)", kc.run_slash("create 'orch root' --assignee alice")

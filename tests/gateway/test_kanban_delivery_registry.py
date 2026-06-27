@@ -1,12 +1,12 @@
-"""Tests for the delivery-adapter registry (event-hub F03).
+"""Tests for the delivery-adapter registry.
 
-The notifier watcher used to be the only delivery path. F03 routes each claimed
+The notifier watcher used to be the only delivery path. The registry routes each claimed
 batch through a registry keyed by ``subscriber_kind``; the gateway send logic is
 the first registered adapter. These tests prove:
 
 - a claimed terminal event is dispatched to the adapter registered for its
   ``subscriber_kind`` (using an in-test fake adapter for a non-gateway kind —
-  no real non-gateway adapter ships in F03);
+  no real non-gateway adapter ships in this change);
 - an unknown/unregistered kind is skipped without error;
 - an adapter delivery failure increments the per-sub failure counter and drops
   the subscription after MAX_SEND_FAILURES, going through the adapter boundary.

@@ -3333,7 +3333,7 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
     payload = {"tool_id": tool_call_id, "name": name, "args": args}
     session = _sessions.get(sid)
-    # F15 (OQ-3 i): record which roots this session subscribed to, so the kanban
+    # Record which roots this session subscribed to, so the kanban
     # live-wake poller only surfaces this session's own supervision notices.
     if name == "kanban_subscribe" and session is not None:
         _record_kanban_subscription(session, args, result)
@@ -8244,13 +8244,13 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-# Seconds between kanban board-DB drains on the poller tick (event-hub F15) —
-# mirrors the CLI M01 throttle (cli.HermesCLI KANBAN_NOTICE_INTERVAL).
+# Seconds between kanban board-DB drains on the poller tick —
+# mirrors the CLI throttle (cli.HermesCLI KANBAN_NOTICE_INTERVAL).
 _KANBAN_NOTICE_INTERVAL = 4.0
 
 
 def _record_kanban_subscription(session: dict, args: dict, result: str) -> None:
-    """F15 (OQ-3 i): remember which roots THIS session subscribed to.
+    """Remember which roots THIS session subscribed to.
 
     Called from `_on_tool_complete` when the agent runs `kanban_subscribe`. The
     kanban supervision notice store is process-global and surface-agnostic, but a
@@ -8278,7 +8278,7 @@ def _record_kanban_subscription(session: dict, args: dict, result: str) -> None:
 
 
 def _submit_kanban_turn(sid: str, session: dict, text: str) -> bool:
-    """Idle-gated re-engage turn for a kanban supervision notice (F15).
+    """Idle-gated re-engage turn for a kanban supervision notice.
 
     Mirrors the process-notification poller's idle gate: chains an agent turn via
     `_run_prompt_submit` only when the session is idle. Returns True if the turn
@@ -8305,12 +8305,12 @@ def _submit_kanban_turn(sid: str, session: dict, text: str) -> bool:
 
 
 def _drain_kanban_tui_notices(sid: str, session: dict) -> None:
-    """F15: surface kanban supervision notices into an idle TUI session.
+    """Surface kanban supervision notices into an idle TUI session.
 
-    The TUI parity of `cli.HermesCLI._drain_kanban_live_notices` (M01). Drains
+    The TUI parity of `cli.HermesCLI._drain_kanban_live_notices`. Drains
     only the orchestrator notices for the roots THIS session subscribed to
     (OQ-3 i ownership, tracked in `session['kanban_roots']`), applies the shared
-    M01 debounce (`kanban_db.supervision_notice_signature`: coalesce per root;
+    Debounce (`kanban_db.supervision_notice_signature`: coalesce per root;
     surface only actionable + changed states), emits a `status.update` chip, and
     chains a re-engage turn through the existing idle gate + `_run_prompt_submit`.
 
@@ -8402,7 +8402,7 @@ def _notification_poller_loop(
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     while not stop_event.is_set() and not session.get("_finalized"):
-        # F15: surface kanban supervision notices for this session's subscribed
+        # surface kanban supervision notices for this session's subscribed
         # roots on the same tick (throttled; idle-gated inside). Isolated from the
         # process-notification path below — never touches completion_queue.
         try:

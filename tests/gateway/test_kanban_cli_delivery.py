@@ -1,9 +1,9 @@
-"""Tests for the CLI delivery adapter (event-hub F05).
+"""Tests for the CLI delivery adapter.
 
-F05 is the first non-gateway delivery adapter. A ``subscriber_kind='cli'``
+This is the first non-gateway delivery adapter. A ``subscriber_kind='cli'``
 subscription has no live push channel, so the adapter persists each claimed
 terminal event as a plain-text notice in the shared ``kanban_notices`` store
-(F06 generalized F05's cli-only table); ``hermes kanban notices`` drains it.
+(the TUI adapter later generalized the cli-only table); ``hermes kanban notices`` drains it.
 These tests prove:
 
 - subscribe cli → complete a task → exactly one notice is delivered; a second
@@ -11,7 +11,7 @@ These tests prove:
 - a ``blocked`` event delivers a notice while a non-terminal event is ignored;
 - the gateway adapter still routes unchanged for gateway subscriptions.
 
-Delivery is driven directly (claim + adapter.deliver) per the F05 gate — no
+Delivery is driven directly (claim + adapter.deliver) — no
 running gateway, no network, no Platform adapter.
 """
 
@@ -47,7 +47,7 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
 
 
 def _subscribe_cli(task_id: str, target_id: str) -> dict:
-    """Declare an explicit cli subscription via the F04 CLI path, return its row."""
+    """Declare an explicit cli subscription via the CLI path, return its row."""
     out = kc.run_slash(
         f"notify-subscribe {task_id} --subscriber-kind cli --target-id {target_id}"
     )
@@ -195,7 +195,7 @@ def test_notices_command_drains_and_clears(kanban_home):
 
 
 def test_gateway_adapter_unchanged_for_gateway_subs(kanban_home):
-    """The gateway adapter still routes a gateway subscription (F05 left it intact)."""
+    """The gateway adapter still routes a gateway subscription (left intact)."""
     out = kc.run_slash("create 'gw still' --assignee worker1")
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     kc.run_slash(f"notify-subscribe {tid} --platform telegram --chat-id chat-9")

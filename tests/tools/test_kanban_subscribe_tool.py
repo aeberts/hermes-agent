@@ -1,9 +1,9 @@
-"""Tests for the kanban_subscribe tool + subscribe-and-yield guidance (F13).
+"""Tests for the kanban_subscribe tool + subscribe-and-yield guidance.
 
 - Schema validates and the tool registers under the orchestrator-mode gate
   (visible to an orchestrator profile, hidden from a task-scoped worker).
-- The handler writes the orchestrator-subtree subscription shape that the F07
-  delivery adapter + F11 reengage-in-tick key off
+- The handler writes the orchestrator-subtree subscription shape that the
+  delivery adapter + reengage-in-tick logic key off
   (``subscriber_kind='orchestrator'``, ``scope='subtree'``,
   ``delivery_policy='supervise'``), with a deterministic CLI-fallback target.
 - The sub is reengage-pickup-able (``list_notify_subs`` filtered on
@@ -71,7 +71,7 @@ def test_subscribe_schema_shape():
     params = KANBAN_SUBSCRIBE_SCHEMA["parameters"]
     assert params["required"] == ["task_id"]
     assert "task_id" in params["properties"]
-    # No scope arg (F13: node-closure model collapses task/subtree).
+    # No scope arg (the node-closure model collapses task/subtree).
     assert "scope" not in params["properties"]
 
 

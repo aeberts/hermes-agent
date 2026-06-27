@@ -208,8 +208,8 @@ class GatewayKanbanWatchersMixin:
                     # filter, so the only kind that needs a connected platform is
                     # already skipped there (and again at adapter-resolution).
                     # A tick-level early-return here would strand every
-                    # non-gateway sub on any host with no messaging platform
-                    # (event-hub F14).
+                    # non-gateway sub on any host with no messaging platform,
+                    # which is exactly what this gate is here to prevent.
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -284,8 +284,7 @@ class GatewayKanbanWatchersMixin:
                                     # CHILDREN's terminal events, not the root's
                                     # own (the root never emits blocked/completed
                                     # — a child does), so the root-only claim
-                                    # above is always empty for them (event-hub
-                                    # F12). Gate on a NON-ADVANCING peek of the
+                                    # above is always empty for them. Gate on a NON-ADVANCING peek of the
                                     # subtree instead; the OrchestratorDelivery-
                                     # Adapter is the SOLE owner of the subtree
                                     # cursor (its internal
@@ -414,8 +413,7 @@ class GatewayKanbanWatchersMixin:
                         # the watcher only peeked (no claim, no real cursor). An
                         # unconditional advance here would write the stale peeked
                         # value back and clobber/rewind the adapter's claim,
-                        # breaking dedup — so skip it for this kind (event-hub
-                        # F12).
+                        # breaking dedup — so skip it for this kind.
                         if subscriber_kind != "orchestrator":
                             await asyncio.to_thread(
                                 self._kanban_advance, sub, d["cursor"], board_slug,

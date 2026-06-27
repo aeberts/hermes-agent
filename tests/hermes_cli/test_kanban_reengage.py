@@ -1,21 +1,21 @@
-"""Tests for orchestrator re-engagement / close-the-loop (event-hub F09 + F10).
+"""Tests for orchestrator re-engagement / close-the-loop.
 
-F10 extends F09's single consumer (``reengage_orchestrator``) to BRANCH on the
-drained F07 snapshot: a ``fan_in_ready`` snapshot still writes the F09
+The blocker-triggered triage extends the single consumer (``reengage_orchestrator``)
+to BRANCH on the drained snapshot: a ``fan_in_ready`` snapshot still writes the
 ``[kanban:reengage]`` comment (judge), while a snapshot carrying a blocked child
 (``kind=="blocked"``) writes a new ``[kanban:triage]`` handoff (answer / unblock
 / escalate) carrying ``{trigger:"blocked", child id, reason}`` + the snapshot.
 The two branches are mutually exclusive per snapshot (a blocked child is never
 terminal, so a snapshot is never both blocked and fan-in-ready), and idempotency
-is still the F07 one-shot drain — a re-block after unblock is a new claimed event
-→ a new triage handoff. F10 is enqueue-only (it writes the handoff; it does NOT
-wake the supervisor — that's F11).
+is still the one-shot drain — a re-block after unblock is a new claimed event
+→ a new triage handoff. The triage path is enqueue-only (it writes the handoff; it
+does NOT wake the supervisor — the live engine does that).
 
-The original F09 docstring follows.
+The original fan-in docstring follows.
 
-Tests for orchestrator re-engagement / close-the-loop (event-hub F09).
+Tests for orchestrator re-engagement / close-the-loop (fan-in).
 
-F09 is the consumer of F07's orchestrator supervision notices: it drains those
+This is the consumer of the orchestrator supervision notices: it drains those
 notices for a target, groups them by ``parent_id`` (root), and for each root
 whose latest drained notice is ``fan_in_ready=true`` appends ONE structured
 ``[kanban:reengage]`` comment carrying the aggregate snapshot to that root. That
@@ -29,15 +29,15 @@ These tests prove (per the spec's "Tests Needed"):
   body contains the snapshot, visible in ``build_worker_context``;
 - a ``fan_in_ready=false`` (partial) notice → no comment, zero re-engagements;
 - a second pass with the store drained → no-op (idempotent via one-shot drain);
-- multi-round: a second F07 fan-in notice → a second re-engagement comment;
+- multi-round: a second fan-in notice → a second re-engagement comment;
 - observational: task count + root status unchanged across the pass;
 - CLI ``kanban reengage --target-id X`` (+ ``--json``) round-trips and reports
   the re-engaged root once, nothing on the second call;
 - end-to-end (no dispatcher): real ``decompose_triage_task`` → subscribe
-  orchestrator(subtree) → complete all subtasks → drive F07 delivery →
+  orchestrator(subtree) → complete all subtasks → drive delivery →
   ``reengage`` writes the snapshot comment that ``build_worker_context`` shows.
 
-Delivery is driven directly (adapter.deliver) per the F05/F06/F07 gate — no
+Delivery is driven directly (adapter.deliver) — no
 running gateway, no network, no Platform adapter.
 """
 
@@ -65,7 +65,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-# --- helpers (mirror the F07 orchestrator-delivery test patterns) -----------
+# --- helpers (mirror the orchestrator-delivery test patterns) -----------
 
 def _create(title: str, *, assignee: str = "worker1") -> str:
     out = kc.run_slash(f"create '{title}' --assignee {assignee}")
@@ -107,7 +107,7 @@ def _unblock(conn, task_id: str) -> None:
 
 
 def _blocked_child(task_id: str, *, reason: str, title: str = "child") -> dict:
-    """An F07-shaped blocked child row (mirrors the orchestrator adapter)."""
+    """A blocked child row (mirrors the orchestrator adapter)."""
     return {
         "task_id": task_id,
         "title": title,
@@ -125,7 +125,7 @@ def _link(conn, root_id: str, subtask_id: str) -> None:
 
 
 def _add_orchestrator_notice(target_id: str, root_id: str, snapshot: dict) -> int:
-    """Hand-build an F07-shaped orchestrator notice (a fan-in snapshot payload)."""
+    """Hand-build an orchestrator notice (a fan-in snapshot payload)."""
     conn = kb.connect()
     try:
         return kb.add_notice(
@@ -248,7 +248,7 @@ def test_multi_round_second_fan_in_yields_second_comment(kanban_home):
     assert len(_reengage("orch-4")) == 1
     assert len(_comments(root)) == 1
 
-    # Round 2: a fresh F07 fan-in notice for the same root.
+    # Round 2: a fresh fan-in notice for the same root.
     _add_orchestrator_notice("orch-4", root, _snapshot(root, fan_in_ready=True))
     results = _reengage("orch-4")
     assert len(results) == 1
@@ -345,9 +345,9 @@ def test_cli_reengage_partial_reports_nothing(kanban_home):
 # --- End-to-end (no dispatcher): the close-the-loop unit proof --------------
 
 def test_end_to_end_real_decompose_reengages_root(kanban_home):
-    """Real decompose → F07 delivery → reengage writes the handoff onto the root.
+    """Real decompose → delivery → reengage writes the handoff onto the root.
 
-    The MBP analogue of M07's live proof: everything up to, but not including,
+    The unit analogue of the live proof: everything up to, but not including,
     the actual dispatcher re-spawn. After reengage, build_worker_context(root)
     contains the fan-in handoff the re-spawned orchestrator would read.
     """
@@ -375,7 +375,7 @@ def test_end_to_end_real_decompose_reengages_root(kanban_home):
     assert _reengage("orch-e2e") == [], "partial fan-in does not re-engage"
     assert _comments(root) == []
 
-    # Complete the last subtask → fan-in flips true → F07 emits a fan-in notice.
+    # Complete the last subtask → fan-in flips true → emits a fan-in notice.
     conn = kb.connect()
     try:
         _complete(conn, sub_b, summary="B done")
@@ -398,7 +398,7 @@ def test_end_to_end_real_decompose_reengages_root(kanban_home):
     assert '"fan_in_ready": true' in ctx
 
 
-# --- F10: blocker-triggered triage handoff ----------------------------------
+# --- blocker-triggered triage handoff ----------------------------------
 
 def test_blocked_child_writes_one_triage_handoff_visible_in_context(kanban_home):
     """Tests Needed #1: a blocked child → exactly one [kanban:triage] handoff on
@@ -479,7 +479,7 @@ def test_block_unblock_block_yields_second_triage_handoff(kanban_home):
     assert len(r1) == 1 and r1[0].trigger == "blocked"
     assert len(_comments(root)) == 1
 
-    # Unblock (and re-block): a fresh F07 notice for the same root/child.
+    # Unblock (and re-block): a fresh notice for the same root/child.
     _add_orchestrator_notice(
         "orch-b3", root,
         _snapshot(root, fan_in_ready=False,
@@ -496,7 +496,7 @@ def test_block_unblock_block_yields_second_triage_handoff(kanban_home):
 
 def test_composition_block_then_fan_in_each_fire_once(kanban_home):
     """Tests Needed #4: block (→triage) then later complete-all (→fan-in) both
-    fire once each; no masking. Driven through real decompose + F07 delivery."""
+    fire once each; no masking. Driven through real decompose + delivery."""
     conn = kb.connect()
     try:
         root = kb.create_task(conn, title="orchestrated goal", triage=True)
@@ -511,7 +511,7 @@ def test_composition_block_then_fan_in_each_fire_once(kanban_home):
 
     sub = _subscribe_orchestrator(root, "orch-b4")
 
-    # Phase 1: subtask A blocks → F07 emits a snapshot with a blocked child →
+    # Phase 1: subtask A blocks → emits a snapshot with a blocked child →
     # one triage handoff. (block requires a running task; claim it first.)
     conn = kb.connect()
     try:

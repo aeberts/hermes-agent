@@ -10040,7 +10040,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             print(f"  Error generating insights: {e}")
 
     def _drain_kanban_live_notices(self, *, force: bool = False) -> None:
-        """M01: surface kanban supervision notices into the idle REPL.
+        """Surface kanban supervision notices into the idle REPL.
 
         Drains the shared ``kanban_notices`` store (the orchestrator
         subscriptions written by ``kanban_subscribe`` + the gateway notifier)
@@ -10057,7 +10057,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         post-turn boundary passes ``force=True`` so a notice that landed during
         the turn surfaces the moment it ends.
 
-        Debounce (M01 refinement): the F07 adapter writes one supervision notice
+        Debounce: the orchestrator-supervision adapter writes one supervision notice
         per subtree event, so a multi-subtask goal emits a notice on every
         intermediate completion — most carrying nothing the supervisor can act
         on. To avoid spending a turn on each, the drain (1) **coalesces** to the
@@ -10113,10 +10113,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     @staticmethod
     def _kanban_notice_signature(notice: dict):
-        """Classify a supervision notice for M01 debounce.
+        """Classify a supervision notice for debounce.
 
         Thin delegator to :func:`kanban_db.supervision_notice_signature`, the
-        single classifier shared with the TUI live-wake (F15) so both interactive
+        single classifier shared with the TUI live-wake so both interactive
         surfaces debounce identically. See that function for the signature shape
         and the ``root_terminal`` (goal-complete vs fan-in) rationale.
         """
@@ -14741,7 +14741,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                                     self._pending_input.put(_synth)
                             except Exception:
                                 pass
-                            # M01: surface kanban supervision notices live (idle
+                            # surface kanban supervision notices live (idle
                             # boundary, throttled). Re-engages the orchestrator on
                             # the next turn; user input still preempts via the queue.
                             try:
@@ -14902,7 +14902,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 
-                        # M01: at the turn boundary, surface any kanban supervision
+                        # at the turn boundary, surface any kanban supervision
                         # notice that landed during the turn (force past the idle
                         # throttle — this fires once per turn end, never mid-turn).
                         try:

@@ -1,7 +1,7 @@
-"""F15 — TUI M01 parity: surface kanban supervision notices into an idle session.
+"""TUI live-wake: surface kanban supervision notices into an idle session.
 
 Covers the ownership hook (`_record_kanban_subscription`) + the poller-tick drain
-(`_drain_kanban_tui_notices`): owned-roots filtering, the shared M01 debounce
+(`_drain_kanban_tui_notices`): owned-roots filtering, the shared debounce
 (progress suppressed, completion wakes after fan-in), and the idle gate.
 """
 import json

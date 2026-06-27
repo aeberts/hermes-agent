@@ -1047,14 +1047,14 @@ def _subscribe_target(task_id: str) -> tuple[str, str]:
 
 
 def _handle_subscribe(args: dict, **kw) -> str:
-    """Subscribe the calling orchestrator to a task's closure (event-hub F13).
+    """Subscribe the calling orchestrator to a task's closure.
 
-    Writes the SAME subscription shape the orchestrator delivery adapter (F07)
-    and the reengage-in-tick (F11) key off: ``subscriber_kind='orchestrator'``,
+    Writes the SAME subscription shape the orchestrator delivery adapter
+    and the reengage-in-tick logic key off: ``subscriber_kind='orchestrator'``,
     ``scope='subtree'``, ``delivery_policy='supervise'``. The observed set is the
     node's closure (``{node} ∪ its direct subtasks``), so a single childless card
     fires on its own terminal event while a decompose root fans in on its
-    subtasks. Idempotent — a repeat call on the same task is a no-op (F04 dedup).
+    subtasks. Idempotent — a repeat call on the same task is a no-op.
     """
     guard = _require_orchestrator_tool("kanban_subscribe")
     if guard:

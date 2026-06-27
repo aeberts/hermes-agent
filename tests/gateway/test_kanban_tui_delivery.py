@@ -1,11 +1,11 @@
-"""Tests for the TUI delivery adapter (event-hub F06).
+"""Tests for the TUI delivery adapter.
 
-F06 is the *second* non-gateway delivery adapter. It proves the F03 registry
+This is the *second* non-gateway delivery adapter. It proves the registry
 generalizes to a new surface with no Kanban-core / watcher changes: registering
 ``DELIVERY_ADAPTERS['tui']`` is sufficient because the watcher already routes
-any non-gateway ``subscriber_kind`` to its adapter (F05 made that gating
+any non-gateway ``subscriber_kind`` to its adapter (the CLI adapter made that gating
 generic). Like CLI, ``subscriber_kind='tui'`` is notice-first — RFC §5.3 lists
-both as "session notice"; live-turn wakeup/WS push is deferred to M01. So
+both as "session notice"; live-turn wakeup/WS push is deferred. So
 "delivery" persists a plain-text notice into the shared, surface-agnostic
 ``kanban_notices`` store keyed by ``subscriber_kind`` + target id; ``hermes
 kanban notices`` drains it.
@@ -21,7 +21,7 @@ These tests prove:
   notice, and draining one kind/target does not consume the other's (the shared
   table is correctly keyed by ``subscriber_kind`` + target).
 
-Delivery is driven directly (claim + adapter.deliver) per the F06 gate — no
+Delivery is driven directly (claim + adapter.deliver) — no
 running gateway, no network, no Platform adapter, no ``tui_gateway`` push.
 """
 
@@ -57,7 +57,7 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
 
 
 def _subscribe(task_id: str, kind: str, target_id: str) -> dict:
-    """Declare an explicit subscription via the F04 CLI path, return its row."""
+    """Declare an explicit subscription via the CLI path, return its row."""
     out = kc.run_slash(
         f"notify-subscribe {task_id} --subscriber-kind {kind} --target-id {target_id}"
     )

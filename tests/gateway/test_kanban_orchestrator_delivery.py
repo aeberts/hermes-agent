@@ -1,6 +1,6 @@
-"""Tests for the orchestrator supervision delivery adapter (event-hub F07).
+"""Tests for the orchestrator supervision delivery adapter.
 
-F07 is the third non-gateway delivery adapter, after CLI (F05) and TUI (F06).
+This is the third non-gateway delivery adapter, after the CLI and TUI adapters.
 A ``subscriber_kind='orchestrator'`` subscription is created with
 ``scope='subtree'`` + ``delivery_policy='supervise'``; on delivery the adapter
 observes the subscribed (root) task's dependency parents (its subtasks) — the
@@ -22,7 +22,7 @@ the whole subtask set, claim-once). These tests prove:
 - the gateway/cli/tui adapters still register and the orchestrator adapter is
   registered.
 
-Delivery is driven directly (adapter.deliver) per the F05/F06 gate — no running
+Delivery is driven directly (adapter.deliver) — no running
 gateway, no network, no Platform adapter.
 """
 
@@ -74,7 +74,7 @@ def _link(conn, root_id: str, subtask_id: str) -> None:
 
 
 def _subscribe_orchestrator(parent_id: str, target_id: str) -> dict:
-    """Subscribe an orchestrator(subtree, supervise) via the F04/F07 CLI path."""
+    """Subscribe an orchestrator(subtree, supervise) via the CLI path."""
     out = kc.run_slash(
         f"notify-subscribe {parent_id} --subscriber-kind orchestrator "
         f"--target-id {target_id} --scope subtree --delivery-policy supervise"
@@ -213,7 +213,7 @@ def test_root_completion_snapshot_carries_root_status_and_goal_complete(kanban_h
     The subtree closure includes the root node, so when the root itself reaches
     `done` a last supervision notice is written. Its children + fan_in_ready are
     identical to the earlier fan-in notice, so the snapshot must carry
-    ``root_status`` (and the message say "goal complete") for the M01 live-wake
+    ``root_status`` (and the message say "goal complete") for the live-wake
     debounce to tell the two apart and surface the final wake.
     """
     parent = _create("root")
@@ -396,7 +396,7 @@ def test_real_decompose_fan_out_is_observed(kanban_home):
     ``decompose_triage_task`` (which links the root *under* every child), then
     subscribe orchestrator(subtree) to the root. The snapshot must list exactly
     the decomposed subtasks, and ``fan_in_ready`` must flip true only once every
-    subtask is done — proving F07 observes the real fan-out mechanism rather than
+    subtask is done — proving the adapter observes the real fan-out mechanism rather than
     the inverted topology the old tests hand-built.
     """
     conn = kb.connect()

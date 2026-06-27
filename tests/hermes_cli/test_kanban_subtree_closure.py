@@ -1,7 +1,7 @@
 """Inclusive subtree-closure tests for the orchestrator claim + peek.
 
-event-hub F13: the orchestrator-subtree observed set is the node's CLOSURE =
-``{node} ∪ {its direct subtasks}`` (transitive descendants stay F08). Both the
+The orchestrator-subtree observed set is the node's CLOSURE =
+``{node} ∪ {its direct subtasks}`` (transitive descendants are left to future work). Both the
 authoritative claim (``claim_unseen_subtree_events_for_sub``) and the read-only
 watcher-gate peek (``subtree_has_unseen_events_for_sub``) share one helper
 (``_subtree_closure_ids``) so they can never diverge.

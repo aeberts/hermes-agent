@@ -1,6 +1,6 @@
-"""Tests for the id-keyed subscription claim/cursor API (event-hub F02).
+"""Tests for the id-keyed subscription claim/cursor API.
 
-F01 added a surrogate ``id`` to ``kanban_notify_subs``; F02 re-keys the
+A surrogate ``id`` was added to ``kanban_notify_subs``; this re-keys the
 claim/cursor API onto that ``id`` while keeping the legacy gateway
 ``(task_id, platform, chat_id, thread_id)`` tuple call paths working through a
 resolver shim. These tests pin both the id-keyed API and the tuple shim, plus

@@ -4,11 +4,11 @@ The kanban notifier watcher (``gateway/kanban_watchers.py``) used to be the
 *only* delivery path: it polled ``kanban_notify_subs``, claimed unseen terminal
 events, and sent them straight through ``self.adapters[platform]``. The event
 substrate (#49190) generalizes that into a small registry keyed by
-``subscriber_kind`` so any surface — gateway today, CLI/TUI later (F05/F06) —
+``subscriber_kind`` so any surface — gateway today, CLI/TUI later —
 can consume the same claimed events through one shared dispatch path.
 
-F03 introduces the registry and re-homes the existing gateway send logic as the
-first registered adapter (``subscriber_kind='gateway'``). Behavior for gateway
+This change introduces the registry and re-homes the existing gateway send logic
+as the first registered adapter (``subscriber_kind='gateway'``). Behavior for gateway
 subscriptions (all current rows) is byte-for-byte identical to the inlined
 loop it replaced — the watcher still owns claiming, the per-sub failure
 accounting / dead-channel drop, the keep-sub-until-final-status rule, the
@@ -162,7 +162,7 @@ def _format_notice(sub: dict, task, ev) -> Optional[str]:
 
     Mirrors the gateway adapter's per-kind phrasing (minus emoji/metadata) so a
     non-gateway subscriber (CLI/TUI) reads the same handoff the gateway would
-    have pushed. The phrasing is surface-agnostic, so CLI (F05) and TUI (F06)
+    have pushed. The phrasing is surface-agnostic, so CLI and TUI
     share it. Returns ``None`` for non-terminal kinds so the caller skips them.
     """
     kind = ev.kind
@@ -213,9 +213,9 @@ def _format_notice(sub: dict, task, ev) -> Optional[str]:
 
 
 def _target_id(sub: dict) -> str:
-    """Resolve the target id for a non-gateway subscription (event-hub F04 convention).
+    """Resolve the target id for a non-gateway subscription.
 
-    F04 persists a non-gateway subscription with ``chat_id=<target-id>`` and a
+    A non-gateway subscription persists with ``chat_id=<target-id>`` and a
     ``target`` JSON carrying ``{"subscriber_kind": <kind>, "target_id": ...}``.
     The convention is the same for cli and tui, so this is surface-agnostic:
     prefer the structured ``target`` id, fall back to ``chat_id``.
@@ -234,7 +234,7 @@ def _target_id(sub: dict) -> str:
 class _NoticeDeliveryAdapter:
     """Base for non-gateway adapters that persist a notice instead of pushing.
 
-    CLI (F05) and TUI (F06) have no live push channel, so "delivery" persists a
+    CLI and TUI have no live push channel, so "delivery" persists a
     plain-text notice to the shared, surface-agnostic ``kanban_notices`` table
     keyed by ``subscriber_kind`` + target id; ``hermes kanban notices`` drains
     it. No gateway, no network, no ``Platform`` adapter — the watcher sets
@@ -292,7 +292,7 @@ class _NoticeDeliveryAdapter:
 def _truncate_line(text: Optional[str], limit: int = 200) -> Optional[str]:
     """First non-empty line of ``text``, truncated to ``limit`` chars.
 
-    Mirrors the size guard ``_format_notice`` already applies (OQ5) so an inline
+    Mirrors the size guard ``_format_notice`` already applies so an inline
     ``summary``/``reason`` in the supervision payload can't balloon a notice row.
     """
     if not text:
@@ -316,8 +316,8 @@ def _truncate_line(text: Optional[str], limit: int = 200) -> Optional[str]:
 class OrchestratorDeliveryAdapter:
     """Deliver a root task's subtask terminal/blocker events to an orchestrator.
 
-    The third non-gateway adapter (event-hub F07), after cli (F05) and tui
-    (F06). A ``subscriber_kind='orchestrator'`` subscription is created with
+    The third non-gateway adapter, after cli and tui
+   . A ``subscriber_kind='orchestrator'`` subscription is created with
     ``scope='subtree'`` + ``delivery_policy='supervise'``; on delivery this
     adapter observes the subscribed (root) task's dependency parents (its
     subtasks). NOTE on terminology: the colloquial "child task / subtask" is the
@@ -331,16 +331,16 @@ class OrchestratorDeliveryAdapter:
        It does its **own** subtree claim rather than consuming the watcher's
        per-task claim, so the watcher needs no orchestrator-specific branch and
        gateway/cli/tui dispatch stays byte-for-byte unchanged.
-    2. **Computes fan-in in code** (OQ4) — all subtasks terminal — via
+    2. **Computes fan-in in code** — all subtasks terminal — via
        :func:`kanban_db.subtree_fan_in_ready`; no new ``task_events`` kind.
-    3. **Persists ONE** supervision notice per delivery (not one row per subtask
-       — OQ3): a human-readable ``message`` line for cli/tui parity plus a
-       structured aggregate-snapshot ``payload`` JSON (OQ5) the orchestrator /
-       F09 re-engagement loop reads to judge the whole subtask set in one turn.
+    3. **Persists ONE** supervision notice per delivery (not one row per subtask):
+       a human-readable ``message`` line for cli/tui parity plus a structured
+       aggregate-snapshot ``payload`` JSON the orchestrator re-engagement loop
+       reads to judge the whole subtask set in one turn.
 
     Observational only: it never creates tasks, judges completion, or changes
     scheduling/promotion (that stays with ``recompute_ready``); re-engagement
-    (waking the orchestrator) is F09, live wake is M01.
+    (waking the orchestrator) and live wake are separate pieces.
     """
 
     _kind = "orchestrator"
@@ -410,14 +410,14 @@ class OrchestratorDeliveryAdapter:
         return row
 
     def _build_snapshot(self, conn, root_id: str, board_slug) -> dict:
-        """Aggregate-snapshot payload over the root's whole subtask set (OQ5).
+        """Aggregate-snapshot payload over the root's whole subtask set.
 
         Iterates the subscribed (root) task's dependency parents (its subtasks)
         — colloquial "child task / subtask" = the root's ``task_links`` parent
         in hermes' dependency model (the root waits for its subtasks). Carries
-        one row per subtask (never per event — OQ3), each with
+        one row per subtask (never per event), each with
         ``{task_id, title, kind, status, assignee, summary|reason, artifacts}``,
-        plus the ``fan_in_ready`` flag computed in code (OQ4). Inline one-liners
+        plus the ``fan_in_ready`` flag computed in code. Inline one-liners
         (truncated ~200 chars) + ids + artifact paths only — never full bodies.
         """
         from hermes_cli import kanban_db as _kb
@@ -469,7 +469,7 @@ class OrchestratorDeliveryAdapter:
             # event triggers a final supervision notice. ``fan_in_ready`` and the
             # children rows are computed purely over the subtasks, so they look
             # identical at fan-in and at root-completion — only ``root_status``
-            # distinguishes "goal complete" from "fan-in ready", which the M01
+            # distinguishes "goal complete" from "fan-in ready", which the
             # live-wake debounce relies on to surface the final wake instead of
             # deduping it against the earlier fan-in notice.
             "root_status": root_status,
@@ -513,13 +513,13 @@ class CLIDeliveryAdapter(_NoticeDeliveryAdapter):
 class TUIDeliveryAdapter(_NoticeDeliveryAdapter):
     """Persist claimed terminal events as TUI notices (``subscriber_kind='tui'``).
 
-    F06's whole proof: this is the *second* non-gateway surface, and it reaches
-    the substrate purely by registering here. RFC §5.3 lists both ``tui`` and
-    ``cli`` as "session notice", so TUI is notice-first exactly like CLI —
-    live-turn wakeup/WS push is deferred to M01. No ``tui_gateway`` push, no
+    The whole proof of this adapter: it is the second non-gateway surface, and it
+    reaches the substrate purely by registering here. RFC §5.3 lists both ``tui``
+    and ``cli`` as "session notice", so TUI is notice-first exactly like CLI —
+    live-turn wakeup/WS push is deferred. No ``tui_gateway`` push, no
     event_publisher, no running server; just a durable notice in the shared
     store. The watcher already routes any non-gateway ``subscriber_kind`` to its
-    registered adapter (F05 generalized the gating), so no watcher change was
+    registered adapter (the CLI adapter generalized the gating), so no watcher change was
     needed.
     """
 
@@ -527,7 +527,7 @@ class TUIDeliveryAdapter(_NoticeDeliveryAdapter):
 
 
 # Registry keyed by ``subscriber_kind``. Production ships the ``gateway`` adapter
-# (all current rows) plus the F05 ``cli`` adapter; F06 registers the ``tui``
+# (all current rows) plus the ``cli`` adapter; the TUI registers the ``tui``
 # adapter here without touching the watcher's dispatch logic. Legacy rows have
 # NULL ``subscriber_kind`` — the watcher normalizes that to ``'gateway'`` before
 # lookup.

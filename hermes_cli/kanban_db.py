@@ -1279,13 +1279,13 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 
--- Notice queue for non-gateway (CLI/TUI) subscribers (event-hub F05/F06). These
+-- Notice queue for non-gateway (CLI/TUI) subscribers. These
 -- surfaces have no live push channel, so a terminal-event delivery for a
 -- non-gateway subscription persists a plain-text notice here keyed by
 -- ``subscriber_kind`` + target id. ``hermes kanban notices`` drains it
 -- (notice-first display); dedup is owned by the subscription's claim cursor, so
 -- the notifier only writes a row the first time an event is claimed. One shared,
--- surface-agnostic table (not per-surface tables) — F06 added the TUI adapter by
+-- surface-agnostic table (not per-surface tables) — the TUI adapter reuses it by
 -- registering against this store, not by reinventing it.
 CREATE TABLE IF NOT EXISTS kanban_notices (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2052,7 +2052,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
-        # Surface-agnostic subscription columns (event-hub F01). Additive:
+        # Surface-agnostic subscription columns. Additive:
         # gateway rows keep platform/chat_id/thread_id as their canonical
         # identity; ``target`` is a denormalized JSON mirror so non-gateway
         # subscriber kinds have a home. ``id`` is a surrogate key backfilled
@@ -2150,7 +2150,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
-    # Surface-agnostic subscription backfill (event-hub F01). Runs after the
+    # Surface-agnostic subscription backfill. Runs after the
     # rebuild pass so a drifted legacy table has already been recreated. The
     # unique id index is created here (not in SCHEMA_SQL) for the same reason
     # the additive tasks indexes are: SQLite parses SCHEMA_SQL against the live
@@ -2169,7 +2169,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 def _backfill_notify_subs(conn: sqlite3.Connection) -> None:
     """Backfill surface-agnostic columns on existing ``kanban_notify_subs`` rows.
 
-    Existing rows predate the generalized schema (event-hub F01): they have a
+    Existing rows predate the generalized schema: they have a
     NULL ``id``/``subscriber_kind``/``target``. Assign each a unique ``id``
     (the row's implicit ``rowid``), mark it ``subscriber_kind='gateway'``, and
     populate ``target`` with the JSON mirror of its gateway identity so
@@ -5745,7 +5745,7 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
-# --- Supervisor-dispatch guards (event-hub F11, OQ-5) ----------------------
+# --- Supervisor-dispatch guards ----------------------
 # A supervised root (one with an ``subscriber_kind='orchestrator'`` notify-sub)
 # whose blocked child the supervisor can't/doesn't resolve stays ``blocked``, so
 # the per-tick board scan would otherwise re-spawn a supervisor every tick
@@ -5867,14 +5867,14 @@ class DispatchResult:
     actively preventing two dispatchers from racing on ``kanban.db``."""
     supervised: list[str] = field(default_factory=list)
     """Root task ids for which an orchestrator-mode supervisor turn was spawned
-    this tick (event-hub F11). A supervised root (one with an
+    this tick. A supervised root (one with an
     ``subscriber_kind='orchestrator'`` notify-sub) that has a ``blocked`` child
     gets a fresh orchestrator-mode wake to triage the block — turning the silent
     deadlock into an automatic re-engagement. Guarded by liveness / cooldown /
     breaker (see :func:`_dispatch_once_locked`)."""
     reengaged: list[str] = field(default_factory=list)
     """Root task ids for which ``reengage_orchestrator`` wrote a handoff this tick
-    (event-hub F11 Increment 2). Run once per orchestrator target each tick,
+    Run once per orchestrator target each tick,
     BEFORE the fan-in re-promotion, so the ``[kanban:reengage]`` (fan-in) /
     ``[kanban:triage]`` (blocked) handoff comment exists before the re-promoted
     root is re-spawned and reads it via ``build_worker_context``."""
@@ -7202,18 +7202,18 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
-    # Reengage-in-tick (event-hub F11 Increment 2): drain F07 orchestrator
-    # supervision notices and write the F09/F10 handoff comment, ONCE per
+    # Reengage-in-tick: drain orchestrator
+    # supervision notices and write the fan-in/triage handoff comment, ONCE per
     # orchestrator target, BEFORE the fan-in re-promotion below. The ordering
     # is load-bearing: ``recompute_ready`` may re-promote a fan-in root, which
     # is then claimed + spawned later in this same tick; the re-spawned root
     # reads its handoff via ``build_worker_context``, so the
     # ``[kanban:reengage]`` / ``[kanban:triage]`` comment must already exist
-    # by then (the F09/M07 ordering requirement). F07 supervision notices are
+    # by then (the re-engagement ordering requirement). Supervision notices are
     # produced by the gateway watcher; this is their in-tick consumer (it does
-    # NOT itself drive F07 ``deliver()``). ``reengage_orchestrator`` mutates
+    # NOT itself drive ``deliver()``). ``reengage_orchestrator`` mutates
     # (writes a comment via its own ``write_txn``), so it is skipped under
-    # ``dry_run``. NOTE: this is entirely separate from the F11-core
+    # ``dry_run``. NOTE: this is entirely separate from the supervisor-dispatch
     # supervisor-dispatch loop near the END of the tick — do not merge them.
     if not dry_run:
         _reengage_targets: list[str] = []
@@ -7222,7 +7222,7 @@ def _dispatch_once_locked(
             if sub.get("subscriber_kind") != "orchestrator":
                 continue
             # Resolve the subscription's notice target id the same way the
-            # gateway's delivery adapter does (F04 convention: prefer the
+            # gateway's delivery adapter does (the non-gateway target convention: prefer the
             # ``target`` JSON's ``target_id``, fall back to ``chat_id``) so the
             # dispatcher drains the exact ``kanban_notices.target_id`` the
             # watcher wrote.
@@ -7570,7 +7570,7 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
 
-    # ---- supervisor dispatch (event-hub F11-core: auto-wake on block) ----
+    # ---- supervisor dispatch (auto-wake on block) ----
     # A blocked child does NOT re-promote its root (a blocked task isn't
     # terminal), so stock ready-dispatch never spawns anything to triage it →
     # the silent deadlock. This loop closes that gap: for each supervised root
@@ -7580,13 +7580,13 @@ def _dispatch_once_locked(
     # profile gets the orchestrator-only ``kanban_unblock``/``kanban_list``
     # tools) to answer+unblock or escalate to the human.
     #
-    # Keyed on blocked-child STATUS, not on a pending handoff (OQ-2): a child
-    # auto-blocked by the dispatcher breaker (quota/auth) carries no F07 notice,
+    # Keyed on blocked-child STATUS, not on a pending handoff: a child
+    # auto-blocked by the dispatcher breaker (quota/auth) carries no supervision notice,
     # so a status scan is the only thing that catches the headline case. The
     # scan is idempotent/self-healing — it re-derives "needs a supervisor" each
     # tick the way ready-dispatch re-derives "needs a worker".
     #
-    # Guards (OQ-5) use ``task_runs`` rows with ``step_key='supervisor'`` (no
+    # Guards use ``task_runs`` rows with ``step_key='supervisor'`` (no
     # schema change): concurrency (a live supervisor PID), cooldown (spaced
     # retries), and a breaker (park after K no-resolution turns; reset once the
     # child is no longer blocked). Same concurrency budget as the other loops.
@@ -8216,7 +8216,7 @@ def _supervisor_spawn(
 ) -> Optional[int]:
     """Fire-and-forget orchestrator-mode supervisor turn for a supervised root.
 
-    A thin variant of :func:`_default_spawn` (event-hub F11-core). Whereas
+    A thin variant of :func:`_default_spawn`. Whereas
     ``_default_spawn`` always sets ``HERMES_KANBAN_TASK`` — pinning the child to
     a single task and thereby withholding the orchestrator-only
     ``kanban_unblock`` / ``kanban_list`` tools (gated on that var being ABSENT
@@ -8287,7 +8287,7 @@ def _supervisor_spawn(
     # a single fresh inspect→triage/judge→stop supervisor turn (it does not want
     # `chat -q`'s kanban goal-loop wrapping). It ALSO deliberately sidesteps the
     # `chat -q`×Codex tool-wiring bug (orthogonal upstream provider bug, tracked
-    # as event-hub R03) until upstream fixes it — so the supervisor's kanban
+    # as NousResearch/hermes-agent#53234) until upstream fixes it — so the supervisor's kanban
     # tools wire correctly under Codex today.
     cmd.extend(["-z", prompt])
 
@@ -8729,7 +8729,7 @@ def _resolve_notify_sub_id(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
 ) -> Optional[int]:
-    """Resolve a subscription's surrogate ``id`` (event-hub F02).
+    """Resolve a subscription's surrogate ``id``.
 
     The claim/cursor API keys on ``id``. New callers can pass ``sub_id``
     directly; legacy gateway callers pass the ``(task_id, platform, chat_id,
@@ -8765,11 +8765,11 @@ def add_notify_sub(
     """Register a source that wants terminal-state notifications for
     ``task_id``. Idempotent on (task, platform, chat, thread).
 
-    Returns the subscription's surrogate ``id`` (event-hub F02) — for a fresh
+    Returns the subscription's surrogate ``id`` — for a fresh
     insert the newly assigned id, for an existing (task, platform, chat,
     thread) tuple the prior row's id.
 
-    Subscriber identity (event-hub F04):
+    Subscriber identity:
 
     - ``subscriber_kind`` defaults to ``'gateway'`` (the messaging path); a
       caller can declare a non-gateway subscriber (e.g. ``'cli'``) explicitly.
@@ -8796,11 +8796,11 @@ def add_notify_sub(
             }
         )
     with write_txn(conn):
-        # Assign a surrogate ``id`` (event-hub F01) inline. INSERT OR IGNORE on
+        # Assign a surrogate ``id`` inline. INSERT OR IGNORE on
         # an existing (task, platform, chat, thread) leaves the prior row's id
         # untouched (and its prior ``scope``/``delivery_policy``). Fresh inserts
         # take the passed ``scope``/``delivery_policy`` — defaults
-        # (``task``/``channel``) preserve the F04/F05/F06 behavior exactly; F07
+        # (``task``/``channel``) preserve the gateway/cli/tui behavior exactly; the orchestrator
         # passes ``subtree``/``supervise`` for an orchestrator subscription.
         next_id = (
             conn.execute(
@@ -8833,7 +8833,7 @@ def add_notify_sub(
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
             )
     # Re-read the (possibly pre-existing) row's surrogate id so callers can key
-    # the claim/cursor API on it directly (event-hub F02).
+    # the claim/cursor API on it directly.
     sub_id = _resolve_notify_sub_id(
         conn,
         task_id=task_id,
@@ -8845,14 +8845,14 @@ def add_notify_sub(
 
 
 def _resolve_sub_target_id(sub: dict) -> str:
-    """Resolve a non-gateway subscription's notice target id (event-hub F04).
+    """Resolve a non-gateway subscription's notice target id.
 
     Mirrors ``gateway.kanban_delivery._target_id`` (kept in sync, but inlined so
-    the DB layer carries no gateway import): F04 persists a non-gateway
+    the DB layer carries no gateway import): a non-gateway subscription persists a
     subscription with ``chat_id=<target-id>`` and a ``target`` JSON carrying
     ``{"subscriber_kind": ..., "target_id": ...}``. Prefer the structured
     ``target`` id, fall back to ``chat_id``. Used by the reengage-in-tick block
-    (F11 Increment 2) so the dispatcher drains the exact
+    so the dispatcher drains the exact
     ``kanban_notices.target_id`` the watcher wrote for this subscription.
     """
     raw = sub.get("target")
@@ -8887,7 +8887,7 @@ def remove_notify_sub(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
 ) -> bool:
-    """Delete a subscription by surrogate ``id`` (event-hub F02), resolving
+    """Delete a subscription by surrogate ``id``, resolving
     the legacy gateway tuple → id when ``sub_id`` is not supplied."""
     resolved = _resolve_notify_sub_id(
         conn,
@@ -8919,7 +8919,7 @@ def unseen_events_for_sub(
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
-    Keyed on the surrogate ``id`` (event-hub F02); legacy gateway callers
+    Keyed on the surrogate ``id``; legacy gateway callers
     pass the ``(task_id, platform, chat_id, thread_id)`` tuple instead, which
     the resolver shim maps to the same row.
 
@@ -8983,7 +8983,7 @@ def claim_unseen_events_for_sub(
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
-    Keyed on the surrogate ``id`` (event-hub F02); legacy gateway callers
+    Keyed on the surrogate ``id``; legacy gateway callers
     pass the ``(task_id, platform, chat_id, thread_id)`` tuple, resolved to
     the same row by the shim.
 
@@ -9041,11 +9041,11 @@ ORCHESTRATOR_CLAIM_KINDS: tuple[str, ...] = (
 def _subtree_closure_ids(conn: sqlite3.Connection, root_id: str) -> list[str]:
     """The observed task_id set for an orchestrator-subtree subscription.
 
-    The node's **closure** = ``{root_id} ∪ {its direct subtasks}`` (event-hub
-    F13). The root's direct subtasks are its ``task_links`` parents: decompose
+    The node's **closure** = ``{root_id} ∪ {its direct subtasks}``. The
+    root's direct subtasks are its ``task_links`` parents: decompose
     links the root under every child (``parent_id = subtask, child_id = root``),
     so the root's direct parents are exactly the subtasks it waits on (no
-    transitive walk — F08 generalizes that).
+    transitive walk — a transitive subtree is left to future work).
 
     This is the SINGLE source of truth shared by
     :func:`claim_unseen_subtree_events_for_sub` (the authoritative,
@@ -9077,7 +9077,7 @@ def claim_unseen_subtree_events_for_sub(
     """Claim unseen terminal+blocker events across the subscribed root's subtasks.
 
     The subtree variant of :func:`claim_unseen_events_for_sub` for an
-    orchestrator subscription (event-hub F07, OQ2). Instead of tailing the
+    orchestrator subscription. Instead of tailing the
     subscribed *root* task's own events, it observes the root's dependency
     **parents** in ``task_links`` — which, per :func:`decompose_triage_task`,
     are exactly its subtasks. Decompose links the root *under* every leaf child
@@ -9085,7 +9085,7 @@ def claim_unseen_subtree_events_for_sub(
     ``child_id`` and its direct ``task_links`` parents are the subtasks it waits
     on. It claims those subtasks' unseen events of the given ``kinds`` (terminal
     + blocker) with ``id > last_event_id`` (transitive-subtree is deferred to
-    F08).
+    future work).
 
     Dedup uses the exact same cursor-CAS as the single-task claim: the
     subscription's ``last_event_id`` advances to the max claimed subtask event id
@@ -9095,7 +9095,7 @@ def claim_unseen_subtree_events_for_sub(
 
     Returns ``(old_cursor, new_cursor, events)`` — empty events leave the cursor
     untouched. The observed set is the node's closure (``{node} ∪ subtasks``),
-    so a childless card (n=1) fires on its OWN terminal event (event-hub F13).
+    so a childless card (n=1) fires on its OWN terminal event.
     """
     kind_list = list(kinds)
     with write_txn(conn):
@@ -9118,13 +9118,13 @@ def claim_unseen_subtree_events_for_sub(
         root_id = row["task_id"]
         old_cursor = int(row["last_event_id"])
         # The observed set is the node's CLOSURE = {node} ∪ {its direct
-        # subtasks} (event-hub F13). The subscribed root's dependency parents
+        # subtasks}. The subscribed root's dependency parents
         # ARE its subtasks: decompose links the root under every child
         # (parent_id = subtask, child_id = root), so direct parents = all
         # subtasks — no transitive walk needed. Including the node itself makes
         # the n=1 (childless card) case fire on its own terminal event; for a
         # decompose root (alive/todo through supervision) it is a no-op until
-        # the root completes. F08 generalizes this to the transitive subtree.
+        # the root completes. A transitive subtree is left to future work.
         closure_ids = _subtree_closure_ids(conn, root_id)
         q = (
             "SELECT * FROM task_events "
@@ -9171,7 +9171,7 @@ def subtree_has_unseen_events_for_sub(
     """Read-only peek: does the subscribed root's subtree have ≥1 unseen event?
 
     The non-advancing companion to :func:`claim_unseen_subtree_events_for_sub`
-    (event-hub F12). It runs the *exact same selection* — the root's
+    It runs the *exact same selection* — the root's
     ``task_links`` parents (its subtasks) emitting terminal+blocker events with
     ``id > last_event_id`` — but only checks **existence** (``LIMIT 1``) and
     **never writes the cursor**: there is no ``BEGIN IMMEDIATE`` and no
@@ -9185,7 +9185,7 @@ def subtree_has_unseen_events_for_sub(
 
     Returns ``True`` iff at least one unseen closure event exists. The observed
     set is the node's closure (``{node} ∪ subtasks``), so a childless card (n=1)
-    can return ``True`` on its own terminal event (event-hub F13).
+    can return ``True`` on its own terminal event.
     """
     kind_list = list(kinds)
     resolved = _resolve_notify_sub_id(
@@ -9207,7 +9207,7 @@ def subtree_has_unseen_events_for_sub(
     root_id = row["task_id"]
     old_cursor = int(row["last_event_id"])
     # Observe the node's CLOSURE = {node} ∪ {its direct subtasks} — the EXACT
-    # same selection as claim_unseen_subtree_events_for_sub (event-hub F13).
+    # same selection as claim_unseen_subtree_events_for_sub.
     # Keeping these two identical is load-bearing: the watcher gate peeks here
     # while the adapter claims there, so a divergence would make the n=1 case
     # peek "nothing" while the claim would deliver.
@@ -9226,7 +9226,7 @@ def subtree_has_unseen_events_for_sub(
 def subtree_fan_in_ready(conn: sqlite3.Connection, root_id: str) -> bool:
     """Return True iff every one of the root's parents (subtasks) is terminal.
 
-    Computes fan-in in code (event-hub F07, OQ4). Per
+    Computes fan-in in code. Per
     :func:`decompose_triage_task` the root is the ``child_id`` and its subtasks
     are its ``task_links`` parents, so this checks "are all of the root's
     parents (subtasks) terminal?" — the mirror image of ``recompute_ready``,
@@ -9262,7 +9262,7 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
-    """Advance a subscription's cursor, keyed on ``id`` (event-hub F02) with a
+    """Advance a subscription's cursor, keyed on ``id`` with a
     legacy gateway-tuple shim."""
     with write_txn(conn):
         resolved = _resolve_notify_sub_id(
@@ -9294,7 +9294,7 @@ def rewind_notify_cursor(
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
-    Keyed on ``id`` (event-hub F02) with a legacy gateway-tuple shim. The CAS
+    Keyed on ``id`` with a legacy gateway-tuple shim. The CAS
     guard only rewinds if no later notifier advanced the row after our claim.
     This keeps retry behavior for transient send failures without clobbering
     newer progress.
@@ -9319,7 +9319,7 @@ def rewind_notify_cursor(
 
 
 # ---------------------------------------------------------------------------
-# Non-gateway notice queue (event-hub F05/F06)
+# Non-gateway notice queue (CLI/TUI)
 # ---------------------------------------------------------------------------
 
 def add_notice(
@@ -9334,14 +9334,14 @@ def add_notice(
 ) -> int:
     """Persist a terminal-event notice for a non-gateway subscriber target.
 
-    Surface-agnostic: CLI (F05) and TUI (F06) share this one store, keyed by
+    Surface-agnostic: CLI and TUI share this one store, keyed by
     ``subscriber_kind`` + target id. These surfaces have no live push channel,
     so the delivery adapter records a plain-text notice here instead of sending;
     ``hermes kanban notices`` drains it. Dedup is owned by the subscription
     claim cursor — the notifier only delivers (and so only writes) the first
     time an event is claimed. Returns the new notice's surrogate id.
 
-    ``payload`` (event-hub F07, OQ9) is an optional JSON string carrying a
+    ``payload`` is an optional JSON string carrying a
     structured continuation snapshot for the orchestrator adapter. cli/tui keep
     it ``NULL`` and rely on ``message`` alone; the orchestrator adapter sets it
     to its aggregate-snapshot JSON. The store stays one shared table.
@@ -9372,11 +9372,11 @@ def drain_notices(
     drain; ``None`` for either means "all" on that axis, so draining one
     surface/target never consumes another's notices.
 
-    ``task_ids`` (event-hub F15) scopes the drain to notices whose ``task_id`` is
+    ``task_ids`` scopes the drain to notices whose ``task_id`` is
     in the given set — the SELECT *and* the DELETE both honor it, so one caller
     can drain only the roots it owns without consuming a sibling's notices (the
     TUI runs several sessions in one process, each owning the roots it
-    subscribed). ``None`` means "all task ids" (the M01/CLI single-session
+    subscribed). ``None`` means "all task ids" (the CLI single-session
     behavior); an empty iterable drains nothing.
     """
     if task_ids is not None:
@@ -9413,7 +9413,7 @@ def drain_session_notices(
 ) -> list[dict]:
     """One-shot drain of ``subscriber_kind`` notices across EVERY board.
 
-    The live-wake surfacing primitive (event-hub M01): an interactive CLI/TUI
+    The live-wake surfacing primitive: an interactive CLI/TUI
     session is one process per session, so every ``orchestrator`` (or ``cli``)
     notice in the shared store belongs to *this* session — the same
     single-session-per-process assumption the background-process notification
@@ -9424,10 +9424,10 @@ def drain_session_notices(
     the underlying :func:`drain_notices` DELETEs the rows, so a notice is
     surfaced exactly once.
 
-    ``task_ids`` (event-hub F15) narrows the drain to those root ids, so a TUI
+    ``task_ids`` narrows the drain to those root ids, so a TUI
     session draining its OWN subscribed roots never consumes a sibling session's
     notices (the single-process-per-session assumption above does not hold for
-    the TUI, which multiplexes sessions). ``None`` keeps the M01/CLI behavior
+    the TUI, which multiplexes sessions). ``None`` keeps the CLI behavior
     (drain all); an empty set drains nothing.
 
     This is a pure read-once DB drain — it never touches a running turn. The
@@ -9476,9 +9476,9 @@ def drain_session_notices(
 def supervision_notice_signature(notice: dict):
     """Classify an orchestrator supervision notice for live-wake debounce.
 
-    Shared by the CLI live-wake (M01, ``cli.HermesCLI._kanban_notice_signature``)
-    and the TUI live-wake (F15) so both surfaces debounce identically. Reads the
-    F07 aggregate-snapshot ``payload`` and returns a hashable signature
+    Shared by the CLI live-wake (``cli.HermesCLI._kanban_notice_signature``)
+    and the TUI live-wake so both surfaces debounce identically. Reads the
+    orchestrator aggregate-snapshot ``payload`` and returns a hashable signature
     ``(actionable, root_terminal, fan_in_or_done, blocked_ids, done, total)``:
     ``actionable`` is true when a child is blocked, the subtree is fan-in ready,
     every subtask is done, or the root itself reached a terminal status — the
@@ -9515,7 +9515,7 @@ def supervision_notice_signature(notice: dict):
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator re-engagement (event-hub F09) — close-the-loop handoff
+# Orchestrator re-engagement — close-the-loop handoff
 # ---------------------------------------------------------------------------
 
 # Recognizable structured-comment prefix mirroring the kanban_swarm blackboard
@@ -9527,13 +9527,13 @@ def supervision_notice_signature(notice: dict):
 #     [kanban:reengage] <human line>
 #     <JSON snapshot block>
 #
-# where the JSON block is the F07 aggregate snapshot verbatim (schema, parent_id,
+# where the JSON block is the orchestrator aggregate snapshot verbatim (schema, parent_id,
 # board, fan_in_ready, children[]).
 REENGAGE_PREFIX = "[kanban:reengage] "
 
-# Recognizable structured-comment prefix for the F10 blocker-triggered handoff.
+# Recognizable structured-comment prefix for the blocker-triggered handoff.
 # Block/triage is a distinct lifecycle outcome, not a flavor of completed, so it
-# earns its own marker (OQ-1). The re-spawned orchestrator turn reads its root's
+# earns its own marker. The re-spawned orchestrator turn reads its root's
 # comment thread via ``build_worker_context``; this prefix lets the injected
 # orchestrator guidance recognize + parse a curated triage handoff. Format of an
 # emitted comment body:
@@ -9555,8 +9555,8 @@ class ReengageResult:
     ``root_id`` is the orchestrator root (the drained notice's ``task_id`` /
     snapshot ``parent_id``); ``comment_id`` is the surrogate id of the single
     handoff comment appended to that root this pass. ``trigger`` distinguishes
-    the F09 fan-in re-engagement (``"fan_in"``) from the F10 blocker-triggered
-    triage handoff (``"blocked"``). Defaults to ``"fan_in"`` so existing F09
+    the fan-in re-engagement (``"fan_in"``) from the blocker-triggered
+    triage handoff (``"blocked"``). Defaults to ``"fan_in"`` so existing
     constructors stay source-compatible.
     """
 
@@ -9595,7 +9595,7 @@ def _triage_comment_body(snapshot: dict, blocked_child: dict) -> str:
     re-spawned orchestrator turn (which reads the root's comment thread via
     ``build_worker_context``) can both eyeball and machine-parse the curated
     blocker handoff. The JSON block carries ``{trigger:"blocked", child id,
-    reason}`` plus the full F07 snapshot for context.
+    reason}`` plus the full supervision snapshot for context.
     """
     parent_id = snapshot.get("parent_id")
     child_id = blocked_child.get("task_id")
@@ -9621,35 +9621,35 @@ def reengage_orchestrator(
     target_id: str,
     author: str = REENGAGE_AUTHOR,
 ) -> list[ReengageResult]:
-    """Materialize F07 snapshots into handoff comments (event-hub F09 + F10).
+    """Materialize supervision snapshots into handoff comments.
 
-    The single consumer of F07's orchestrator supervision notices and the
+    The single consumer of the orchestrator supervision notices and the
     heartbeat that closes the autonomous loop: drains the orchestrator notices
     for ``target_id`` (one-shot, claim-once), groups them by ``parent_id``
     (root), keeps each root's **latest** drained snapshot, and **branches** on
     it (the two arms are mutually exclusive per snapshot):
 
     - ``fan_in_ready=true`` → ONE ``[kanban:reengage]`` comment carrying the
-      aggregate snapshot (F09 fan-in → judge / route more work / finish).
+      aggregate snapshot (fan-in: judge / route more work / finish).
     - a **blocked** child (``kind=="blocked"``; implies ``fan_in_ready`` false,
       since a blocked child is never terminal) → ONE ``[kanban:triage]`` handoff
-      carrying ``{trigger:"blocked", child id, reason}`` + the snapshot (F10
+      carrying ``{trigger:"blocked", child id, reason}`` + the snapshot (blocker-triggered
       blocker-triggered triage → answer / unblock / escalate).
     - neither (a partial with no blocked child) → passive; no comment.
 
     The comment lands in the root's comment thread, which ``build_worker_context``
     surfaces to the re-spawned orchestrator turn — so the curated handoff reaches
-    the fresh turn in-context with zero new read path (OQ-B). Each F07 snapshot
+    the fresh turn in-context with zero new read path. Each supervision snapshot
     is a FULL aggregate, so dropping a superseded partial on drain loses nothing.
 
-    Idempotency is the one-shot drain (OQ-C): a re-run with no new notice is a
-    no-op, and a second decompose round (new subtasks → new F07 fan-in notice)
+    Idempotency is the one-shot drain: a re-run with no new notice is a
+    no-op, and a second decompose round (new subtasks → new fan-in notice)
     correctly yields a second re-engagement. NO separate "already reengaged"
     marker is written — that would break the multi-round loop.
 
     Observational toward scheduling: the only mutation is the comment (+ its
     ``commented`` event). No promotion, status write, or task creation — the
-    root re-promotion stays ``recompute_ready``'s job (OQ-A).
+    root re-promotion stays ``recompute_ready``'s job.
 
     Returns one :class:`ReengageResult` (root_id + comment_id + trigger) per
     root that produced a handoff, in the order the roots' notices were drained.
@@ -9683,13 +9683,13 @@ def reengage_orchestrator(
     for root_id in order:
         snapshot = latest_by_root[root_id]
         children = snapshot.get("children") or []
-        # Branch on the drained snapshot (event-hub F10). The two arms are
+        # Branch on the drained snapshot. The two arms are
         # mutually exclusive by construction: fan_in_ready requires ALL children
         # terminal, but a blocked child is NOT terminal, so a snapshot is never
         # both blocked-and-fan-in-ready (a blocker naturally masks fan-in —
         # correct: don't judge "done" while a child is stuck).
         if snapshot.get("fan_in_ready"):
-            # F09 fan-in re-engagement → judge. Body unchanged.
+            # Fan-in re-engagement: judge. Body unchanged.
             body = _reengage_comment_body(snapshot)
             # add_comment opens its own write_txn (and emits the ``commented``
             # event); do NOT wrap this in another open txn (the nesting pitfall).
@@ -9702,7 +9702,7 @@ def reengage_orchestrator(
             (c for c in children if c.get("kind") == "blocked"), None,
         )
         if blocked_child is not None:
-            # F10 blocker-triggered triage → answer / unblock / escalate.
+            # Blocker-triggered triage: answer / unblock / escalate.
             body = _triage_comment_body(snapshot, blocked_child)
             comment_id = add_comment(conn, root_id, author=author, body=body)
             results.append(ReengageResult(

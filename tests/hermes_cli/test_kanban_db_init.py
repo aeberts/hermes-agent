@@ -179,15 +179,15 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# event-hub F01: kanban_notify_subs surface-agnostic schema migration.
+# kanban_notify_subs surface-agnostic schema migration.
 # ---------------------------------------------------------------------------
 
-# Columns the pre-F01 schema lacked, added additively on connect().
-_F01_NEW_COLS = ("id", "subscriber_kind", "target", "scope", "delivery_policy")
+# Columns the legacy schema lacked, added additively on connect().
+_NEW_SUB_COLS = ("id", "subscriber_kind", "target", "scope", "delivery_policy")
 
 
 def _make_pre_f01_notify_db(path: Path) -> None:
-    """Write a current DB but downgrade ``kanban_notify_subs`` to its pre-F01
+    """Write a current DB but downgrade ``kanban_notify_subs`` to its legacy
     shape: INTEGER ``last_event_id`` (so it does NOT drift/rebuild) but without
     the ``id``/``subscriber_kind``/``target``/``scope``/``delivery_policy``
     columns. This exercises the pure additive-column + backfill path.
@@ -220,14 +220,14 @@ def _make_pre_f01_notify_db(path: Path) -> None:
 
 
 def test_pre_f01_notify_db_gains_columns_without_data_loss(tmp_path, monkeypatch):
-    """A pre-F01 notify table (no surrogate-id columns) migrates in place: the
+    """A legacy notify table (no surrogate-id columns) migrates in place: the
     new columns appear and no existing row data is lost."""
     db_path = _setup_home(tmp_path, monkeypatch)
     _make_pre_f01_notify_db(db_path)
 
     with kb.connect(db_path) as conn:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
-        for col in _F01_NEW_COLS:
+        for col in _NEW_SUB_COLS:
             assert col in cols, f"missing {col!r} after migration"
 
         rows = conn.execute(

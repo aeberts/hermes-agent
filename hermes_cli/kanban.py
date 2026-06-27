@@ -723,8 +723,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--notifier-profile", default=None,
         help="Profile gateway that owns/delivers this subscription (default: active profile)",
     )
-    # event-hub F07 (OQ6): additive scope/policy flags. Defaults preserve the
-    # F04/F05/F06 behavior exactly; an orchestrator supervises a subtree with
+    # Additive scope/policy flags. Defaults preserve the gateway/cli/tui
+    # behavior exactly; an orchestrator supervises a subtree with
     # ``--scope subtree --delivery-policy supervise``.
     p_nsub.add_argument(
         "--scope", default="task", choices=["task", "subtree"],
@@ -768,7 +768,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_notices.add_argument("--json", action="store_true")
 
-    # --- supervise (event-hub F07): drain orchestrator supervision notices ---
+    # --- supervise: drain orchestrator supervision notices ---
     p_supervise = sub.add_parser(
         "supervise",
         help="Drain pending orchestrator supervision notices for a target "
@@ -783,10 +783,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Print the structured supervision payload (default: the message line)",
     )
 
-    # --- reengage (event-hub F09): close-the-loop orchestrator re-engagement ---
+    # --- reengage: close-the-loop orchestrator re-engagement ---
     p_reengage = sub.add_parser(
         "reengage",
-        help="Materialize F07 snapshots into a handoff comment on each root "
+        help="Materialize supervision snapshots into a handoff comment on each root "
              "(subscriber-kind orchestrator): a fan-in reengage or a blocked "
              "triage. Drains one-shot.",
     )
@@ -2523,7 +2523,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         platform, chat_id = args.platform, args.chat_id
         thread_id, target = args.thread_id, args.target
     else:
-        # Explicit non-gateway subscriber (event-hub F04): declare the target
+        # Explicit non-gateway subscriber: declare the target
         # directly instead of inferring it from the calling session. The PK
         # columns are filled by convention (platform=kind, chat_id=target-id,
         # thread_id='') so the schema's NOT NULL PK stays satisfied; the real
@@ -2592,7 +2592,7 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
 
 
 def _cmd_notices(args: argparse.Namespace) -> int:
-    """Drain pending non-gateway terminal-event notices (event-hub F05/F06).
+    """Drain pending non-gateway terminal-event notices (CLI/TUI).
 
     The notifier persists a notice per claimed terminal event for any
     non-gateway subscription (``subscriber_kind`` cli/tui) into one shared,
@@ -2618,7 +2618,7 @@ def _cmd_notices(args: argparse.Namespace) -> int:
 
 
 def _cmd_supervise(args: argparse.Namespace) -> int:
-    """Drain pending orchestrator supervision notices for a target (event-hub F07).
+    """Drain pending orchestrator supervision notices for a target.
 
     The orchestrator adapter persists one structured supervision snapshot per
     delivery into the shared ``kanban_notices`` store, keyed by
@@ -2652,10 +2652,10 @@ def _cmd_supervise(args: argparse.Namespace) -> int:
 
 
 def _cmd_reengage(args: argparse.Namespace) -> int:
-    """Close-the-loop orchestrator re-engagement pass (event-hub F09 + F10).
+    """Close-the-loop orchestrator re-engagement pass.
 
     Runs :func:`kanban_db.reengage_orchestrator` for ``--target-id``: drains
-    F07 orchestrator supervision notices (one-shot) and branches per root on its
+    Drains orchestrator supervision notices (one-shot) and branches per root on its
     latest drained snapshot — a ``fan_in_ready`` snapshot appends a
     ``[kanban:reengage]`` comment (judge), a snapshot with a blocked child
     appends a ``[kanban:triage]`` handoff (answer/unblock/escalate), and a

@@ -1,4 +1,4 @@
-"""Tests for the supervisor-dispatch sub-loop (event-hub F11-core, Increment 1).
+"""Tests for the supervisor-dispatch sub-loop.
 
 The dispatcher auto-wakes a fresh ORCHESTRATOR-MODE turn when a supervised root
 (one carrying an ``subscriber_kind='orchestrator'`` notify-sub) has a ``blocked``
@@ -380,16 +380,16 @@ def test_fan_in_root_no_supervisor_but_stock_dispatch_unaffected(
 
 
 # ---------------------------------------------------------------------------
-# Increment 2 (reengage-in-tick): the dispatch tick runs reengage_orchestrator
+# Reengage-in-tick: the dispatch tick runs reengage_orchestrator
 # once per orchestrator target each tick, BEFORE the fan-in re-promotion, so the
-# F09/F10 handoff comment exists before the re-promoted root is re-spawned.
+# fan-in/triage handoff comment exists before the re-promoted root is re-spawned.
 #
 # Mirrors the notice-seeding helpers from tests/hermes_cli/test_kanban_reengage.py
-# (F07-shaped orchestrator notices via add_notice + a fan-in snapshot payload).
+# (orchestrator notices via add_notice + a fan-in snapshot payload).
 # ---------------------------------------------------------------------------
 
 def _add_orchestrator_notice(target_id: str, root_id: str, snapshot: dict) -> int:
-    """Hand-build an F07-shaped orchestrator supervision notice (snapshot payload)."""
+    """Hand-build an orchestrator supervision notice (snapshot payload)."""
     conn = kb.connect()
     try:
         return kb.add_notice(
@@ -421,7 +421,7 @@ def _comment_bodies(conn, root_id: str) -> list[str]:
 
 def test_reengage_in_tick_fan_in_writes_reengage_handoff(kanban_home):
     """fan_in_ready=true notice → dispatch tick writes a [kanban:reengage]
-    comment on the root and result.reengaged lists it (Increment 2 fan-in)."""
+    comment on the root and result.reengaged lists it (fan-in)."""
     conn = kb.connect()
     try:
         root = kb.create_task(conn, title="root goal", assignee="worker")

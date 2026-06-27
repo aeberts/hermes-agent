@@ -4769,7 +4769,7 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator subtree claim + notice payload (event-hub F07)
+# Orchestrator subtree claim + notice payload
 # ---------------------------------------------------------------------------
 
 def _orch_sub(conn, parent_id, target_id="orch"):
