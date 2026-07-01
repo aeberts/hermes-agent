@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import types
@@ -25,6 +26,16 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+def _init_git_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
 # ---------------------------------------------------------------------------
@@ -68,10 +79,15 @@ def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
 
 
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
-    """Windows must use a real process lock, not a no-op sidecar open."""
+    """Windows must use a real (non-blocking) process lock, not a no-op open.
+
+    The init lock acquires with LK_NBLCK in a bounded retry loop (#36644) so a
+    wedged holder can never block connect() forever; a clean acquire takes the
+    lock once and releases it once.
+    """
     calls: list[tuple[int, int, int]] = []
     fake_msvcrt = types.SimpleNamespace(
-        LK_LOCK=1,
+        LK_NBLCK=3,
         LK_UNLCK=2,
         locking=lambda fd, mode, nbytes: calls.append((fd, mode, nbytes)),
     )
@@ -80,10 +96,12 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
 
     db_path = tmp_path / "kanban.db"
     with kb._cross_process_init_lock(db_path):
-        assert calls == [(calls[0][0], fake_msvcrt.LK_LOCK, 1)]
+        # Acquired exactly once via the non-blocking byte-range lock.
+        assert [call[1:] for call in calls] == [(fake_msvcrt.LK_NBLCK, 1)]
 
+    # Released once on exit.
     assert [call[1:] for call in calls] == [
-        (fake_msvcrt.LK_LOCK, 1),
+        (fake_msvcrt.LK_NBLCK, 1),
         (fake_msvcrt.LK_UNLCK, 1),
     ]
 
@@ -2064,6 +2082,7 @@ def test_scratch_workspace_created_under_hermes_home(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
     assert ws.exists()
     assert ws.is_dir()
@@ -2077,21 +2096,230 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
             conn, title="biz", workspace_kind="dir", workspace_path=str(target)
         )
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
     assert ws == target
     assert ws.exists()
 
 
-def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
-    target = str(tmp_path / ".worktrees" / "my-task")
+def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="ship", workspace_kind="worktree", workspace_path=target
+            conn, title="ship", workspace_kind="worktree", workspace_path=str(repo)
         )
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
-    assert str(ws) == target
+
+    expected = repo / ".worktrees" / t
+    assert ws == expected
+    assert ws.exists()
+    repo_common = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    ws_common = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert ws_common == repo_common
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {expected}" in listed
+    assert f"branch refs/heads/wt/{t}" in listed
+
+
+def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path):
+    """A worktree task created with no explicit path inherits the board's
+    default_workdir as its anchor and materializes a per-task linked worktree
+    at ``<repo>/.worktrees/<id>`` — NOT the dispatcher's CWD, and NOT the
+    shared default_workdir verbatim (which would collapse every task into one
+    directory)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("wt-default-board", default_workdir=str(repo))
+    with kb.connect(board="wt-default-board") as conn:
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree", board="wt-default-board"
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task, board="wt-default-board")
+
+    expected = repo / ".worktrees" / t
+    assert ws == expected
+    assert ws.exists()
+    assert ws != repo  # not the shared default verbatim
+
+
+def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
+    """With neither an explicit workspace_path nor a board default_workdir,
+    resolution fails loudly pointing at default_workdir / worktree:<path> —
+    rather than silently materializing under the dispatcher's CWD (the old
+    behavior that scattered worktrees under whatever dir launched the
+    gateway)."""
+    # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
+    # code would have "succeeded" — proving the new code does NOT use cwd.
+    decoy_repo = tmp_path / "decoy"
+    _init_git_repo(decoy_repo)
+    monkeypatch.chdir(decoy_repo)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        with pytest.raises(ValueError, match="default_workdir"):
+            kb.resolve_workspace(task)
+
+
+def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "custom-task"
+    branch = "wt/custom-task"
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=branch,
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+
+    assert ws == target
+    assert ws.exists()
+    repo_common = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    ws_common = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert ws_common == repo_common
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {target}" in listed
+    assert f"branch refs/heads/{branch}" in listed
+
+
+def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("worktree-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return None
+
+    with kb.connect(board="worktree-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-board",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-board")
+        task = kb.get_task(conn, tid)
+
+    expected = repo / ".worktrees" / tid
+    assert result.spawned == [(tid, "sentinel", str(expected))]
+    assert spawns == [(tid, str(expected))]
+    assert task is not None
+    assert task.workspace_path == str(expected)
+    assert task.branch_name == f"wt/{tid}"
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {expected}" in listed
+    assert f"branch refs/heads/wt/{tid}" in listed
+
+
+def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("worktree-rerun-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return None
+
+    with kb.connect(board="worktree-rerun-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-rerun-board",
+        )
+        first = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
+        first_task = kb.get_task(conn, tid)
+        assert first_task is not None
+        expected = repo / ".worktrees" / tid
+        assert first_task.workspace_path == str(expected)
+        assert first_task.branch_name == f"wt/{tid}"
+
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        second = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
+        second_task = kb.get_task(conn, tid)
+
+    assert first.spawned == [(tid, "sentinel", str(expected))]
+    assert second.spawned == [(tid, "sentinel", str(expected))]
+    assert spawns == [(tid, str(expected)), (tid, str(expected))]
+    assert second_task is not None
+    assert second_task.workspace_path == str(expected)
+    actual_branch = subprocess.run(
+        ["git", "-C", str(expected), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_branch == f"wt/{tid}"
+    assert second_task.branch_name == actual_branch
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert listed.count(f"worktree {expected}\n") == 1
+    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    assert f"branch refs/heads/{actual_branch}" in listed
 
 
 # ---------------------------------------------------------------------------
@@ -2103,6 +2331,7 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="scratchy")
         task = kb.get_task(conn, t)
+        assert task is not None
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
         assert ws.is_dir()
@@ -4537,3 +4766,148 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator subtree claim + notice payload
+# ---------------------------------------------------------------------------
+
+def _orch_sub(conn, parent_id, target_id="orch"):
+    """Create an orchestrator(subtree, supervise) sub and return its surrogate id."""
+    return kb.add_notify_sub(
+        conn, task_id=parent_id, platform="orchestrator", chat_id=target_id,
+        subscriber_kind="orchestrator", scope="subtree",
+        delivery_policy="supervise",
+    )
+
+
+def test_add_notify_sub_persists_scope_and_delivery_policy(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root")
+        _orch_sub(conn, parent, "orch-1")
+        sub = kb.list_notify_subs(conn, parent)[0]
+        assert sub["scope"] == "subtree"
+        assert sub["delivery_policy"] == "supervise"
+        # Defaults preserved for an ordinary gateway sub.
+        other = kb.create_task(conn, title="gw")
+        kb.add_notify_sub(conn, task_id=other, platform="telegram", chat_id="c")
+        gw = kb.list_notify_subs(conn, other)[0]
+        assert gw["scope"] == "task"
+        assert gw["delivery_policy"] == "channel"
+    finally:
+        conn.close()
+
+
+def test_notice_payload_round_trip(kanban_home):
+    """add_notice stores a JSON payload; drain_notices returns it verbatim."""
+    import json
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t")
+        snap = {"schema": 1, "parent_id": tid, "fan_in_ready": True, "children": []}
+        kb.add_notice(
+            conn, subscriber_kind="orchestrator", target_id="orch-1",
+            task_id=tid, kind="supervision", message="msg",
+            payload=json.dumps(snap),
+        )
+        rows = kb.drain_notices(conn, subscriber_kind="orchestrator", target_id="orch-1")
+        assert len(rows) == 1
+        assert json.loads(rows[0]["payload"]) == snap
+        # cli/tui notices keep payload NULL.
+        kb.add_notice(
+            conn, subscriber_kind="cli", target_id="sess", task_id=tid,
+            kind="completed", message="done",
+        )
+        cli_rows = kb.drain_notices(conn, subscriber_kind="cli", target_id="sess")
+        assert cli_rows[0]["payload"] is None
+    finally:
+        conn.close()
+
+
+def test_subtree_claim_gathers_direct_children_terminal_events(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root")
+        a = kb.create_task(conn, title="a")
+        b = kb.create_task(conn, title="b")
+        kb.complete_task(conn, a, summary="a done")
+        kb.block_task(conn, b, reason="stuck")
+        # Real decompose direction: each subtask is the PARENT of the root.
+        kb.link_tasks(conn, a, parent)
+        kb.link_tasks(conn, b, parent)
+        sub_id = _orch_sub(conn, parent)
+
+        old, new, events = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        kinds = sorted(e.kind for e in events)
+        assert kinds == ["blocked", "completed"]
+        assert {e.task_id for e in events} == {a, b}
+        assert new > old
+    finally:
+        conn.close()
+
+
+def test_subtree_claim_dedups_on_recelaim_via_cursor_cas(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root")
+        a = kb.create_task(conn, title="a")
+        kb.complete_task(conn, a, summary="x")
+        kb.link_tasks(conn, a, parent)  # subtask is the root's parent
+        sub_id = _orch_sub(conn, parent)
+
+        _o1, _n1, first = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        assert len(first) == 1
+        # Re-claim: cursor already advanced past the event → nothing.
+        _o2, _n2, second = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        assert second == []
+        assert _n2 == _o2, "cursor unchanged on an empty re-claim"
+    finally:
+        conn.close()
+
+
+def test_subtree_claim_ignores_non_terminal_and_zero_children(kanban_home):
+    conn = kb.connect()
+    try:
+        # Zero children → empty, cursor untouched.
+        lonely = kb.create_task(conn, title="lonely")
+        sub_id = _orch_sub(conn, lonely, "orch-lonely")
+        old, new, events = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub_id)
+        assert events == []
+        assert old == new
+
+        # A subtask with only a non-terminal event yields nothing.
+        parent = kb.create_task(conn, title="root2")
+        c = kb.create_task(conn, title="c")
+        kb.link_tasks(conn, c, parent)  # subtask is the root's parent
+        with kb.write_txn(conn):
+            kb._append_event(conn, c, kind="heartbeat")
+        sub2 = _orch_sub(conn, parent, "orch-2")
+        _o, _n, evs = kb.claim_unseen_subtree_events_for_sub(conn, sub_id=sub2)
+        assert evs == []
+    finally:
+        conn.close()
+
+
+def test_subtree_fan_in_ready(kanban_home):
+    conn = kb.connect()
+    try:
+        # A root with no subtasks (no task_links parents) is never fan-in-ready.
+        lonely = kb.create_task(conn, title="lonely")
+        assert kb.subtree_fan_in_ready(conn, lonely) is False
+
+        # Real decompose direction: each subtask is the PARENT of the root, so
+        # the subtasks are NOT gated by the root and can be driven terminal
+        # directly — no unlink/relink gymnastics.
+        parent = kb.create_task(conn, title="root")
+        a = kb.create_task(conn, title="a")
+        b = kb.create_task(conn, title="b")
+        kb.complete_task(conn, a, summary="a")
+        kb.link_tasks(conn, a, parent)
+        kb.link_tasks(conn, b, parent)  # b is todo → active
+        assert kb.subtree_fan_in_ready(conn, parent) is False
+
+        kb.complete_task(conn, b, summary="b")
+        assert kb.subtree_fan_in_ready(conn, parent) is True
+    finally:
+        conn.close()

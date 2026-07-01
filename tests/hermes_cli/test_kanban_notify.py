@@ -1,8 +1,10 @@
 import asyncio
+import json
 import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
+from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -186,8 +188,8 @@ async def test_notifier_second_blocked_delivers(kanban_home):
         tid = kb.create_task(conn, title="test task", assignee="worker1")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
 
-        # Cycle 1: blocked
-        kb.block_task(conn, tid, reason="first block")
+        # Cycle 1: blocked for one reason
+        kb.block_task(conn, tid, reason="first block", kind="needs_input")
     finally:
         conn.close()
 
@@ -197,14 +199,18 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    # Cycle 2: unblock → block run again
+    # Cycle 2: unblock → block again for a DIFFERENT reason. A distinct
+    # block cause must still notify. (A *same*-cause re-block instead trips
+    # the unblock-loop breaker and routes to triage — covered by
+    # test_kanban_block_kinds.py; here we exercise two genuinely different
+    # blocks, which is the case the user wants notified twice.)
     runner._running = True
     tick_count = 0
 
     conn = kb.connect()
     try:
         kb.unblock_task(conn, tid)
-        kb.block_task(conn, tid, reason="second block")
+        kb.block_task(conn, tid, reason="second block", kind="capability")
     finally:
         conn.close()
 
@@ -653,3 +659,220 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+# ---------------------------------------------------------------------------
+# explicit subscribe primitive
+#
+# A caller can declare a non-gateway subscriber (subscriber_kind + target)
+# explicitly instead of inferring identity from HERMES_SESSION_*. The gateway
+# default path stays byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_add_notify_sub_gateway_default_unchanged(kanban_home):
+    """Default call (no subscriber_kind/target) writes the gateway row exactly
+    as before: subscriber_kind='gateway' and the gateway-tuple target JSON."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="w")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            thread_id="th1", user_id="u1",
+        )
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["subscriber_kind"] == "gateway"
+    assert s["platform"] == "telegram"
+    assert s["chat_id"] == "chat1"
+    assert json.loads(s["target"]) == {
+        "platform": "telegram", "chat_id": "chat1",
+        "thread_id": "th1", "user_id": "u1",
+    }
+
+
+def test_add_notify_sub_explicit_non_gateway(kanban_home):
+    """An explicit subscriber_kind + target persists the declared identity and
+    still satisfies the NOT NULL PK columns via the convention
+    (platform=kind, chat_id=target-id, thread_id='')."""
+    target = json.dumps({"subscriber_kind": "cli", "target_id": "sess-abc"})
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="w")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="cli", chat_id="sess-abc",
+            thread_id="", subscriber_kind="cli", target=target,
+        )
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["subscriber_kind"] == "cli"
+    assert s["target"] == target
+    # PK columns populated, not NULL.
+    assert s["platform"] == "cli"
+    assert s["chat_id"] == "sess-abc"
+    assert s["thread_id"] == ""
+
+
+def test_cli_subscribe_explicit_target_writes_declared_row(kanban_home):
+    """`/kanban notify-subscribe --subscriber-kind cli --target-id ...` writes
+    the declared (subscriber_kind, target), not a gateway row."""
+    out = kc.run_slash("create 'explicit sub' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    out = kc.run_slash(
+        f"notify-subscribe {tid} --subscriber-kind cli --target-id sess-xyz"
+    )
+    assert "cli:sess-xyz" in out
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["subscriber_kind"] == "cli"
+    assert s["platform"] == "cli"
+    assert s["chat_id"] == "sess-xyz"
+    assert json.loads(s["target"]) == {
+        "subscriber_kind": "cli", "target_id": "sess-xyz",
+    }
+
+
+def test_cli_subscribe_non_gateway_requires_target_id(kanban_home):
+    out = kc.run_slash("create 't' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    out = kc.run_slash(f"notify-subscribe {tid} --subscriber-kind cli")
+    assert "target-id is required" in out
+
+
+def test_cli_subscribe_gateway_path_unchanged(kanban_home):
+    """The default gateway flags still produce a gateway subscription with the
+    gateway-tuple target — identical to legacy behavior."""
+    out = kc.run_slash("create 'gw sub' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    out = kc.run_slash(
+        f"notify-subscribe {tid} --platform telegram --chat-id chat1"
+    )
+    # Confirmation message shows the real platform (legacy behavior), not "gateway".
+    assert "telegram:chat1" in out
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["subscriber_kind"] == "gateway"
+    assert s["platform"] == "telegram"
+    assert s["chat_id"] == "chat1"
+    assert json.loads(s["target"])["platform"] == "telegram"
+
+
+def test_cli_subscribe_gateway_missing_flags_errors(kanban_home):
+    out = kc.run_slash("create 't' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    out = kc.run_slash(f"notify-subscribe {tid}")
+    assert "--platform and --chat-id are required" in out
+
+
+def test_explicit_target_wins_over_session_env(kanban_home, monkeypatch):
+    """The written row reflects the declared target even when HERMES_SESSION_*
+    is set to a different identity — explicit subscribe is authoritative and
+    does not consult the session env at all."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-from-env")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "key-from-env")
+
+    out = kc.run_slash("create 'authoritative' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    kc.run_slash(
+        f"notify-subscribe {tid} --subscriber-kind cli --target-id declared-id"
+    )
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["subscriber_kind"] == "cli"
+    assert s["chat_id"] == "declared-id"
+    # The session env identity did NOT leak into the row.
+    assert "chat-from-env" not in (s["target"] or "")
+    assert s["chat_id"] != "chat-from-env"
+
+
+def test_notify_list_surfaces_subscriber_kind_and_target(kanban_home):
+    out = kc.run_slash("create 'list-fields' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(
+        f"notify-subscribe {tid} --subscriber-kind cli --target-id sess-1"
+    )
+    out = kc.run_slash(f"notify-list {tid}")
+    assert "[cli]" in out
+    assert "target=" in out
+    assert "sess-1" in out
+
+
+def test_get_delivery_adapter_cli_registered(kanban_home):
+    """Registers the CLI delivery adapter for subscriber_kind='cli'.
+    (The explicit-subscribe step left this None; the CLI adapter wires it.)"""
+    from gateway.kanban_delivery import CLIDeliveryAdapter, get_delivery_adapter
+    assert isinstance(get_delivery_adapter("cli"), CLIDeliveryAdapter)
+    # gateway adapter still present.
+    assert get_delivery_adapter("gateway") is not None
+    assert get_delivery_adapter(None) is not None
+
+
+def test_notify_subscribe_scope_and_delivery_policy_flags(kanban_home):
+    """Additive --scope/--delivery-policy persist on the sub row;
+    defaults preserve the gateway/cli/tui behavior exactly."""
+    import re
+    tid = re.search(
+        r"(t_[a-f0-9]+)", kc.run_slash("create 'orch root' --assignee alice")
+    ).group(1)
+
+    # Orchestrator subtree/supervise subscription.
+    out = kc.run_slash(
+        f"notify-subscribe {tid} --subscriber-kind orchestrator "
+        f"--target-id orch-1 --scope subtree --delivery-policy supervise"
+    )
+    assert "orchestrator:orch-1" in out
+    conn = kb.connect()
+    try:
+        s = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+    assert s["subscriber_kind"] == "orchestrator"
+    assert s["scope"] == "subtree"
+    assert s["delivery_policy"] == "supervise"
+
+    # Defaults: an ordinary cli sub stays task/channel.
+    tid2 = re.search(
+        r"(t_[a-f0-9]+)", kc.run_slash("create 'cli root' --assignee alice")
+    ).group(1)
+    kc.run_slash(f"notify-subscribe {tid2} --subscriber-kind cli --target-id sess")
+    conn = kb.connect()
+    try:
+        s2 = kb.list_notify_subs(conn, tid2)[0]
+    finally:
+        conn.close()
+    assert s2["scope"] == "task"
+    assert s2["delivery_policy"] == "channel"

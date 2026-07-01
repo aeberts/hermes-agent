@@ -33,6 +33,8 @@ import logging
 import os
 from typing import Any, Optional
 
+from agent.redact import redact_sensitive_text
+from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -175,6 +177,27 @@ def _connect(board: Optional[str] = None):
     """
     from hermes_cli import kanban_db as kb
     return kb, kb.connect(board=board)
+
+
+def _goal_judge_available() -> bool:
+    """True when an auxiliary client is configured for the goal judge.
+
+    ``judge_goal`` is fail-open at the source: when no auxiliary model can
+    be reached it returns a ``"continue"`` verdict that is indistinguishable
+    from a real "not done yet" judgment. The completion gate must not treat
+    that as a rejection, or an unconfigured/degraded auxiliary model would
+    wedge every ``goal_mode`` worker (it could never close its own task).
+
+    So we probe availability first and only enforce the gate when a judge is
+    actually reachable. This mirrors the same client lookup ``judge_goal``
+    performs internally.
+    """
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+        client, model = get_text_auxiliary_client("goal_judge")
+    except Exception:
+        return False
+    return client is not None and bool(model)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +343,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -487,6 +511,17 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    if summary:
+        summary = redact_sensitive_text(str(summary), force=True)
+    if result:
+        result = redact_sensitive_text(str(result), force=True)
+    if metadata is not None and isinstance(metadata, dict):
+        meta_json = json.dumps(metadata)
+        meta_json = redact_sensitive_text(meta_json, force=True)
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -554,6 +589,37 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # Goal-mode pre-completion judge gate (Issue #38367).
+            # Prevent workers from bypassing the auxiliary judge by
+            # calling kanban_complete before acceptance criteria are met.
+            # Only enforce when a judge is actually reachable — see
+            # _goal_judge_available for why an unavailable judge fails open.
+            task = kb.get_task(conn, tid)
+            if task and task.goal_mode and _goal_judge_available():
+                verdict = "done"
+                reason = ""
+                try:
+                    verdict, reason, _ = judge_goal(
+                        goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                        last_response=(summary or result or "").strip(),
+                    )
+                except Exception as judge_exc:
+                    # Defensive: judge_goal swallows its own errors, but if
+                    # it ever raises, fail open rather than wedge the worker.
+                    logger.warning(
+                        "goal judge check failed, allowing completion: %s",
+                        judge_exc,
+                        exc_info=True,
+                    )
+                if verdict != "done":
+                    return tool_error(
+                        f"Goal completion rejected by judge: {reason}. "
+                        f"To proceed, either: (1) provide explicit acceptance "
+                        f"evidence in your summary matching the task's criteria, "
+                        f"or (2) create continuation tasks with parents=[{tid}] "
+                        f"and keep this task alive."
+                    )
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -609,13 +675,21 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    reason = redact_sensitive_text(str(reason), force=True)
+    kind = args.get("kind")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+            conn.close()
+            return tool_error(
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+            )
         try:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
+                kind=kind,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -624,7 +698,15 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            # Tell the worker where the task actually landed so it doesn't
+            # assume it's sitting in 'blocked' when routing sent it elsewhere.
+            landed = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=landed.status if landed else "blocked",
+                block_kind=kind,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -696,6 +778,7 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
+    body = redact_sensitive_text(str(body), force=True)
     # Author is intentionally derived from the worker's own runtime
     # identity, NOT from caller-supplied args. Comments are injected
     # into the next worker's system prompt by ``build_worker_context``
@@ -753,6 +836,7 @@ def _handle_create(args: dict, **kw) -> str:
     # fall back to scratch as before. Explicit None path stays None.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    project_id = args.get("project") or args.get("project_id")
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
@@ -793,6 +877,10 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.workspace_kind:
                         workspace_kind = _self_task.workspace_kind
                         workspace_path = _self_task.workspace_path
+                        # Keep follow-up children inside the same project so the
+                        # whole subtree shares one repo + branch convention.
+                        if project_id is None and _self_task.project_id:
+                            project_id = _self_task.project_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -803,6 +891,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                project_id=project_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -928,6 +1017,84 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             _exc, platform, bool(chat_id),
         )
         return False
+
+
+def _subscribe_target(task_id: str) -> tuple[str, str]:
+    """Resolve the orchestrator subscription's (platform, chat_id) target.
+
+    Mirrors how :func:`_maybe_auto_subscribe` resolves the calling session's
+    identity (``HERMES_SESSION_PLATFORM`` / ``HERMES_SESSION_CHAT_ID``), but for
+    an **orchestrator-subtree** sub. For a real channel session we want the
+    notice to ride that session's chat back; for a CLI session (no channel) we
+    fall back to a DETERMINISTIC target derived from the task_id, so the row is
+    still found by ``list_notify_subs`` / ``reengage_orchestrator`` (which key
+    off ``subscriber_kind=='orchestrator'`` + ``task_id``) and stays idempotent
+    on repeat calls.
+    """
+    chat_id = ""
+    try:
+        from gateway.session_context import get_session_env
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+    except Exception:
+        chat_id = ""
+    if not chat_id:
+        chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "") or ""
+    if not chat_id:
+        # CLI / unattached: no channel. Derive a stable per-task target so the
+        # sub is reengage-pickup-able and de-dups on repeat calls.
+        chat_id = f"orch:{task_id}"
+    return "orchestrator", chat_id
+
+
+def _handle_subscribe(args: dict, **kw) -> str:
+    """Subscribe the calling orchestrator to a task's closure.
+
+    Writes the SAME subscription shape the orchestrator delivery adapter
+    and the reengage-in-tick logic key off: ``subscriber_kind='orchestrator'``,
+    ``scope='subtree'``, ``delivery_policy='supervise'``. The observed set is the
+    node's closure (``{node} ∪ its direct subtasks``), so a single childless card
+    fires on its own terminal event while a decompose root fans in on its
+    subtasks. Idempotent — a repeat call on the same task is a no-op.
+    """
+    guard = _require_orchestrator_tool("kanban_subscribe")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    tid = str(tid)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"kanban_subscribe: unknown task {tid}")
+            platform, chat_id = _subscribe_target(tid)
+            notifier_profile = os.environ.get("HERMES_PROFILE")
+            sub_id = kb.add_notify_sub(
+                conn, task_id=tid,
+                platform=platform, chat_id=chat_id,
+                notifier_profile=notifier_profile,
+                subscriber_kind="orchestrator",
+                scope="subtree",
+                delivery_policy="supervise",
+            )
+            return _ok(
+                task_id=tid,
+                subscription_id=sub_id,
+                subscriber_kind="orchestrator",
+                scope="subtree",
+                delivery_policy="supervise",
+                target=chat_id,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_subscribe: {e}")
+    except Exception as e:
+        logger.exception("kanban_subscribe failed")
+        return tool_error(f"kanban_subscribe: {e}")
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -1171,11 +1338,16 @@ KANBAN_COMPLETE_SCHEMA = {
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
-        "Transition the task to blocked because you need human input "
-        "to proceed. ``reason`` will be shown to the human on the "
-        "board and included in context when someone unblocks you. "
-        "Use for genuine blockers only — don't block on things you can "
-        "resolve yourself."
+        "Stop work on this task and route it according to WHY you're stuck. "
+        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
+        "goes to todo and auto-resumes when that task finishes, no human "
+        "needed), 'needs_input' (you need a human decision/answer), "
+        "'capability' (a hard wall: no access, missing credentials, an action "
+        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "``reason`` is shown to the human on the board. If a task keeps "
+        "getting unblocked and re-blocked for the same reason, it is "
+        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "block on things you can resolve yourself."
     ),
     "parameters": {
         "type": "object",
@@ -1187,9 +1359,18 @@ KANBAN_BLOCK_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "What you need answered, in one or two sentences. "
-                    "Don't paste the whole conversation; the human has "
-                    "the board and can ask follow-ups via comments."
+                    "What you need answered or what stopped you, in one or "
+                    "two sentences. Don't paste the whole conversation; the "
+                    "human has the board and can ask follow-ups via comments."
+                ),
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "description": (
+                    "Why you're blocked. 'dependency' waits in todo and "
+                    "resumes automatically; the others surface to a human. "
+                    "Omit only if none apply."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1329,6 +1510,15 @@ KANBAN_CREATE_SCHEMA = {
                     "Relative paths are rejected at dispatch."
                 ),
             },
+            "project": {
+                "type": "string",
+                "description": (
+                    "Optional project id or slug to link the task to. When "
+                    "set, the task becomes a git worktree under the project's "
+                    "primary repo with a deterministic branch (project slug + "
+                    "task id), instead of a random branch."
+                ),
+            },
             "triage": {
                 "type": "boolean",
                 "description": (
@@ -1368,8 +1558,8 @@ KANBAN_CREATE_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Skill names to force-load into the dispatched "
-                    "worker (in addition to the built-in kanban-worker "
-                    "skill). Use this to pin a task to a specialist "
+                    "worker. The kanban lifecycle is already injected "
+                    "automatically; use this to pin a task to a specialist "
                     "context — e.g. ['translation'] for a translation "
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
@@ -1440,6 +1630,31 @@ KANBAN_LINK_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
+    },
+}
+
+KANBAN_SUBSCRIBE_SCHEMA = {
+    "name": "kanban_subscribe",
+    "description": (
+        "Subscribe to a task so you are re-engaged when its work blocks or "
+        "finishes — instead of polling kanban_list. Observes the task's "
+        "closure: the task itself plus its direct subtasks (tasks linked as "
+        "its dependencies). Use this to supervise a decomposed goal (subscribe "
+        "to the root, then end your turn) or to be told when a single card is "
+        "done. Idempotent — calling twice on the same task is a no-op."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": (
+                    "Task id to subscribe to (a goal root or a single card)."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
     },
 }
 
@@ -1527,4 +1742,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_subscribe",
+    toolset="kanban",
+    schema=KANBAN_SUBSCRIBE_SCHEMA,
+    handler=_handle_subscribe,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🔔",
 )

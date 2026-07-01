@@ -16,11 +16,43 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _resolve_auto_decompose_settings(
+    load_config: Callable[[], Any],
+) -> "tuple[bool, int]":
+    """Resolve the live (enabled, per_tick) auto-decompose settings.
+
+    Read fresh from config on every dispatcher tick (#49638) so that flipping
+    ``kanban.auto_decompose: false`` to STOP runaway fan-out takes effect on the
+    next tick instead of requiring a gateway restart. Auto-decompose is a
+    safety toggle — a user who sees it create and launch tasks they didn't
+    intend reaches for this flag to halt it, and a stale boot-captured value
+    silently ignoring that change is the bug reported in #49638.
+
+    Fails **safe**: if the config read raises, return ``(False, 3)`` — a
+    transient read error must never re-enable a feature the user turned off,
+    nor fall back to the burst-prone default-on behaviour. ``per_tick`` is
+    clamped to ``>= 1``.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return False, 3
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    enabled = bool(kcfg.get("auto_decompose", True))
+    try:
+        per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
+    except (TypeError, ValueError):
+        per_tick = 3
+    if per_tick < 1:
+        per_tick = 1
+    return enabled, per_tick
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -122,6 +154,7 @@ class GatewayKanbanWatchersMixin:
             )
             return
         from gateway.config import Platform as _Platform
+        from gateway.kanban_delivery import get_delivery_adapter as _get_delivery_adapter
         try:
             from hermes_cli import kanban_db as _kb
         except Exception:
@@ -166,9 +199,17 @@ class GatewayKanbanWatchersMixin:
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
-                    if not active_platforms:
-                        logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                    # Do NOT bail the tick when no messaging platform is
+                    # connected (``self.adapters == {}``) — orchestrator/cli/tui
+                    # subs are surface-agnostic and deliver through their own
+                    # registered adapter with no Platform. The per-sub gateway
+                    # gate below (``subscriber_kind == 'gateway' and platform not
+                    # in active_platforms``) is the authoritative connectivity
+                    # filter, so the only kind that needs a connected platform is
+                    # already skipped there (and again at adapter-resolution).
+                    # A tick-level early-return here would strand every
+                    # non-gateway sub on any host with no messaging platform,
+                    # which is exactly what this gate is here to prevent.
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -223,23 +264,62 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), owner_profile, notifier_profile,
                                     )
                                     continue
+                                # The "adapter not connected" skip only applies
+                                # to gateway subscriptions, whose ``platform`` is
+                                # a real messaging platform that must have a live
+                                # adapter. Non-gateway kinds (cli/tui) carry the
+                                # kind in ``platform`` and deliver through their
+                                # own registered adapter (no live Platform), so
+                                # they bypass this connected-platform gate.
+                                subscriber_kind = sub.get("subscriber_kind") or "gateway"
                                 platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
+                                if subscriber_kind == "gateway" and platform not in active_platforms:
                                     logger.debug(
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
-                                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                    conn,
-                                    task_id=sub["task_id"],
-                                    platform=sub["platform"],
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
-                                )
-                                if not events:
-                                    continue
+                                if subscriber_kind == "orchestrator":
+                                    # Orchestrator subtree subs care about their
+                                    # CHILDREN's terminal events, not the root's
+                                    # own (the root never emits blocked/completed
+                                    # — a child does), so the root-only claim
+                                    # above is always empty for them. Gate on a NON-ADVANCING peek of the
+                                    # subtree instead; the OrchestratorDelivery-
+                                    # Adapter is the SOLE owner of the subtree
+                                    # cursor (its internal
+                                    # claim_unseen_subtree_events_for_sub is the
+                                    # one authoritative claimer that advances it).
+                                    # The watcher only peeks here — never claims —
+                                    # so the single-claimer invariant can't be
+                                    # broken from a distance.
+                                    if not _kb.subtree_has_unseen_events_for_sub(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                    ):
+                                        continue
+                                    # No watcher-side cursor to advance: the
+                                    # adapter advances the subtree cursor itself
+                                    # on a successful claim. The post-deliver
+                                    # advance is skipped for this kind (below),
+                                    # so these placeholder cursor values are
+                                    # never written back.
+                                    old_cursor = cursor = 0
+                                    events = []
+                                else:
+                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                        kinds=TERMINAL_KINDS,
+                                    )
+                                    if not events:
+                                        continue
                                 task = _kb.get_task(conn, sub["task_id"])
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
@@ -263,163 +343,81 @@ class GatewayKanbanWatchersMixin:
                     task = d["task"]
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
-                    try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        continue
-                    adapter = self.adapters.get(plat)
-                    if adapter is None:
+                    # Route the claimed batch to the delivery adapter registered
+                    # for this subscription's subscriber_kind. Legacy/gateway
+                    # rows have NULL/'gateway' kind; unknown kinds are skipped
+                    # below (mirrors the "adapter not connected" platform skip in
+                    # _collect). The watcher keeps all the safety machinery —
+                    # claim/cursor, failure accounting, dead-channel drop,
+                    # keep-sub-until-final-status, multi-board fan-out — and only
+                    # the per-event "send" step lives behind the adapter.
+                    subscriber_kind = sub.get("subscriber_kind") or "gateway"
+                    delivery_adapter = _get_delivery_adapter(subscriber_kind)
+                    if delivery_adapter is None:
                         logger.debug(
-                            "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
-                            platform_str, sub["task_id"],
-                        )
-                        await asyncio.to_thread(
-                            self._kanban_rewind,
-                            sub,
-                            d["cursor"],
-                            d.get("old_cursor", 0),
-                            board_slug,
+                            "kanban notifier: no delivery adapter for subscriber_kind "
+                            "%r (task %s); skipping",
+                            subscriber_kind, sub.get("task_id"),
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
-                    for ev in d["events"]:
-                        kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        else:
-                            continue
-                        metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
-                            metadata["thread_id"] = sub["thread_id"]
-                        sub_key = (
-                            sub["task_id"], sub["platform"],
-                            sub["chat_id"], sub.get("thread_id") or "",
-                        )
+                    # Only gateway subscriptions need a live messaging ``Platform``
+                    # adapter resolved from ``self.adapters`` (and the
+                    # disconnect→rewind safety it carries). Non-gateway kinds
+                    # (cli/tui) deliver through their own registered adapter
+                    # which needs no Platform, so they bypass this resolution
+                    # with ``adapter=None``. ``platform_str`` for a cli sub is
+                    # 'cli', which would otherwise raise ValueError in
+                    # ``_Platform(...)`` and be skipped before reaching its
+                    # adapter.
+                    adapter = None
+                    if subscriber_kind == "gateway":
                         try:
-                            await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            # Unknown platform string; skip and advance cursor so
+                            # we don't replay forever.
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
                             )
+                            continue
+                        adapter = self.adapters.get(plat)
+                        if adapter is None:
                             logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                                "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
+                                platform_str, sub["task_id"],
                             )
-                            # After delivering the text notification, surface
-                            # any artifact paths the worker referenced in
-                            # ``kanban_complete(summary=..., artifacts=[...])``
-                            # (or the legacy ``result`` field) as native
-                            # uploads. ``extract_local_files`` finds bare
-                            # absolute paths in the summary;
-                            # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
-                                try:
-                                    await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
-                                        chat_id=sub["chat_id"],
-                                        metadata=metadata,
-                                        event_payload=getattr(ev, "payload", None),
-                                        task=task,
-                                    )
-                                except Exception as art_exc:
-                                    logger.debug(
-                                        "kanban notifier: artifact delivery for %s failed: %s",
-                                        sub["task_id"], art_exc,
-                                    )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
-                        except Exception as exc:
-                            fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
-                            logger.warning(
-                                "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
-                                sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
                             )
-                            if fails >= MAX_SEND_FAILURES:
-                                logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
-                                    sub["task_id"], platform_str, fails,
-                                )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
-                            else:
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
-                                )
-                            # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
-                            break
-                    else:
+                            continue
+                    sub_key = (
+                        sub["task_id"], sub["platform"],
+                        sub["chat_id"], sub.get("thread_id") or "",
+                    )
+                    d["adapter"] = adapter
+                    result = await delivery_adapter.deliver(self, d)
+                    if result.ok:
+                        # Reset the failure counter on success.
+                        sub_fail_counts.pop(sub_key, None)
                         # All events delivered; advance cursor. The cursor
                         # is the dedup mechanism — it prevents re-delivery
                         # of the same event on subsequent ticks.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
+                        #
+                        # Orchestrator subtree subs are the ONE exception: the
+                        # adapter is the sole owner of the subtree cursor (it
+                        # advanced it inside its own claim during deliver), and
+                        # the watcher only peeked (no claim, no real cursor). An
+                        # unconditional advance here would write the stale peeked
+                        # value back and clobber/rewind the adapter's claim,
+                        # breaking dedup — so skip it for this kind.
+                        if subscriber_kind != "orchestrator":
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
                         # Unsubscribe only when the task has reached a truly
                         # final status (done / archived). For blocked /
                         # gave_up / crashed / timed_out the subscription is
@@ -431,6 +429,34 @@ class GatewayKanbanWatchersMixin:
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
+                            )
+                    else:
+                        fails = sub_fail_counts.get(sub_key, 0) + 1
+                        sub_fail_counts[sub_key] = fails
+                        logger.warning(
+                            "kanban notifier: delivery failed for %s on %s "
+                            "(attempt %d/%d)",
+                            sub["task_id"], platform_str, fails,
+                            MAX_SEND_FAILURES,
+                        )
+                        if fails >= MAX_SEND_FAILURES:
+                            logger.warning(
+                                "kanban notifier: dropping subscription "
+                                "%s on %s after %d consecutive send failures",
+                                sub["task_id"], platform_str, fails,
+                            )
+                            await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                            sub_fail_counts.pop(sub_key, None)
+                        else:
+                            # Rewind the pre-send claim on transient failure so
+                            # a later tick can retry. After too many failures,
+                            # dropping the subscription is the terminal action.
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
@@ -985,17 +1011,20 @@ class GatewayKanbanWatchersMixin:
         # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
         # remainder defers to subsequent ticks.
-        auto_decompose_enabled = bool(kanban_cfg.get("auto_decompose", True))
-        try:
-            auto_decompose_per_tick = int(
-                kanban_cfg.get("auto_decompose_per_tick", 3) or 3
-            )
-        except (TypeError, ValueError):
-            auto_decompose_per_tick = 3
-        if auto_decompose_per_tick < 1:
-            auto_decompose_per_tick = 1
+        #
+        # The flag is re-read from config EVERY tick (#49638) rather than
+        # captured once at boot. Auto-decompose is a safety toggle: a user who
+        # sees it fan out and run tasks they didn't intend reaches for
+        # ``kanban.auto_decompose: false`` to STOP it — and that must take
+        # effect on the next tick, not require a gateway restart. (Reported:
+        # auto-decompose created and launched destructive tasks while the user
+        # was still typing the task description, and the flag "couldn't be
+        # disabled" because the gateway had captured its boot-time value.)
+        def _read_auto_decompose_settings() -> tuple[bool, int]:
+            """Re-resolve (enabled, per_tick) from current config each tick."""
+            return _resolve_auto_decompose_settings(_load_config)
 
-        def _auto_decompose_tick() -> int:
+        def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
             """Run the auto-decomposer for up to N triage tasks across all
             boards. Returns the number of triage tasks that were
             successfully decomposed or specified this tick.
@@ -1090,8 +1119,12 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                if auto_decompose_enabled:
-                    await asyncio.to_thread(_auto_decompose_tick)
+                # Re-read the auto-decompose toggle live each tick so a user
+                # flipping kanban.auto_decompose=false to STOP runaway fan-out
+                # takes effect on the next tick, not on gateway restart (#49638).
+                _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
+                if _ad_enabled:
+                    await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):

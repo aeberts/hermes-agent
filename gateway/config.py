@@ -288,7 +288,13 @@ class SessionResetPolicy:
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
     notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
-    
+    # A background process this many hours old (or older) no longer blocks
+    # session idle/daily reset. A forgotten preview server should not keep a
+    # session alive forever (#29177). The process is NOT killed — only ignored
+    # by the reset guard. Raise this if you run legitimate multi-day jobs whose
+    # liveness should pin the conversation open.
+    bg_process_max_age_hours: int = 24
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
@@ -296,6 +302,7 @@ class SessionResetPolicy:
             "idle_minutes": self.idle_minutes,
             "notify": self.notify,
             "notify_exclude_platforms": list(self.notify_exclude_platforms),
+            "bg_process_max_age_hours": self.bg_process_max_age_hours,
         }
     
     @classmethod
@@ -306,12 +313,14 @@ class SessionResetPolicy:
         idle_minutes = data.get("idle_minutes")
         notify = data.get("notify")
         exclude = data.get("notify_exclude_platforms")
+        bg_max_age = data.get("bg_process_max_age_hours")
         return cls(
             mode=mode if mode is not None else "both",
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=_coerce_bool(notify, True),
             notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            bg_process_max_age_hours=bg_max_age if bg_max_age is not None else 24,
         )
 
 
@@ -336,6 +345,15 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Whether the gateway shows a "typing…" / "is thinking…" status indicator
+    # while the agent processes a message on this platform. Default True
+    # preserves prior behavior. Set False on platforms where the indicator is
+    # unwanted (e.g. Slack's assistant.threads.setStatus "is thinking…", which
+    # disables the compose box, or any platform where users find the bubble
+    # noisy). Drives the per-message _keep_typing refresh loop in
+    # gateway/platforms/base.py.
+    typing_indicator: bool = True
+
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -345,6 +363,7 @@ class PlatformConfig:
             "extra": self.extra,
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
+            "typing_indicator": self.typing_indicator,
         }
         if self.token:
             result["token"] = self.token
@@ -368,6 +387,13 @@ class PlatformConfig:
         if _grn is None:
             _grn = data.get("extra", {}).get("gateway_restart_notification")
 
+        # typing_indicator mirrors gateway_restart_notification: it may arrive
+        # top-level or bridged into extra by the shared-key loop in
+        # load_gateway_config(), so check both.
+        _typing = data.get("typing_indicator")
+        if _typing is None:
+            _typing = data.get("extra", {}).get("typing_indicator")
+
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -375,6 +401,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            typing_indicator=_coerce_bool(_typing, True),
             extra=data.get("extra", {}),
         )
 
@@ -749,7 +776,12 @@ class GatewayConfig:
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
-        """Return the effective unauthorized-DM behavior for a platform."""
+        """Return the effective unauthorized-DM behavior for a platform.
+
+        Email is inbox-shaped, not chat-shaped, so it defaults to ``"ignore"``
+        unless ``platforms.email.unauthorized_dm_behavior`` explicitly opts
+        into pairing. A global default does not opt email into pairing.
+        """
         if platform:
             platform_cfg = self.platforms.get(platform)
             if platform_cfg and "unauthorized_dm_behavior" in platform_cfg.extra:
@@ -757,6 +789,8 @@ class GatewayConfig:
                     platform_cfg.extra.get("unauthorized_dm_behavior"),
                     self.unauthorized_dm_behavior,
                 )
+            if platform == Platform.EMAIL:
+                return "ignore"
         return self.unauthorized_dm_behavior
 
     def get_notice_delivery(self, platform: Optional[Platform] = None) -> str:
@@ -1016,6 +1050,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if "typing_indicator" in platform_cfg:
+                    bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue
@@ -1907,12 +1943,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             try:
-                if not entry.check_fn():
-                    continue
+                platform = Platform(entry.name)
             except Exception as e:
-                logger.debug("check_fn for %s raised: %s", entry.name, e)
+                logger.debug("unknown platform name %r: %s", entry.name, e)
                 continue
-            platform = Platform(entry.name)
             existing_cfg = config.platforms.get(platform)
             # Respect an explicit ``enabled: false`` (YAML / gateway.json /
             # dashboard PUT).  ``_enabled_explicit`` is set in
@@ -1996,6 +2030,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                             entry.name,
                         )
                         continue
+            # Verify dependencies LAST — only for platforms that are already
+            # enabled or passed the credential gate above.  For adapter plugins
+            # ``check_fn`` lazy-INSTALLS the platform SDK (pip) as a side
+            # effect, so running it as an unconditional sweep over every
+            # registered platform made ``load_gateway_config()`` pip-install
+            # Discord/Telegram/Slack/Feishu/Dingtalk on every call — including
+            # the desktop/dashboard readiness probe (``GET /api/status``, which
+            # awaits this synchronously) — even when the user configured none
+            # of them.  That blocked startup until every install finished and
+            # caused the desktop app to time out and boot-loop (stuck at 94%).
+            try:
+                if not entry.check_fn():
+                    continue
+            except Exception as e:
+                logger.debug("check_fn for %s raised: %s", entry.name, e)
+                continue
             if platform not in config.platforms:
                 config.platforms[platform] = PlatformConfig()
             config.platforms[platform].enabled = True

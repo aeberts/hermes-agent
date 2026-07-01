@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -175,3 +176,145 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
         )
         assert isinstance(cursor, int)
         assert isinstance(events, list)
+
+
+# ---------------------------------------------------------------------------
+# kanban_notify_subs surface-agnostic schema migration.
+# ---------------------------------------------------------------------------
+
+# Columns the legacy schema lacked, added additively on connect().
+_NEW_SUB_COLS = ("id", "subscriber_kind", "target", "scope", "delivery_policy")
+
+
+def _make_pre_f01_notify_db(path: Path) -> None:
+    """Write a current DB but downgrade ``kanban_notify_subs`` to its legacy
+    shape: INTEGER ``last_event_id`` (so it does NOT drift/rebuild) but without
+    the ``id``/``subscriber_kind``/``target``/``scope``/``delivery_policy``
+    columns. This exercises the pure additive-column + backfill path.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.executescript(
+        """
+        DROP TABLE kanban_notify_subs;
+        CREATE TABLE kanban_notify_subs (
+            task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,
+            notifier_profile TEXT, created_at INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, platform, chat_id, thread_id));
+        """
+    )
+    conn.execute(
+        "INSERT INTO kanban_notify_subs "
+        "(task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id) "
+        "VALUES ('task-1', 'telegram', '123', 'th1', 'u1', 1000, 5)"
+    )
+    conn.execute(
+        "INSERT INTO kanban_notify_subs "
+        "(task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id) "
+        "VALUES ('task-1', 'discord', '999', '', NULL, 1100, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_pre_f01_notify_db_gains_columns_without_data_loss(tmp_path, monkeypatch):
+    """A legacy notify table (no surrogate-id columns) migrates in place: the
+    new columns appear and no existing row data is lost."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_pre_f01_notify_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
+        for col in _NEW_SUB_COLS:
+            assert col in cols, f"missing {col!r} after migration"
+
+        rows = conn.execute(
+            "SELECT * FROM kanban_notify_subs ORDER BY platform"
+        ).fetchall()
+        assert len(rows) == 2
+        by_platform = {r["platform"]: r for r in rows}
+        # Legacy identity columns and the cursor are untouched.
+        assert by_platform["telegram"]["chat_id"] == "123"
+        assert by_platform["telegram"]["thread_id"] == "th1"
+        assert by_platform["telegram"]["last_event_id"] == 5
+        assert by_platform["discord"]["chat_id"] == "999"
+
+
+def test_backfill_assigns_id_kind_and_target_for_existing_rows(tmp_path, monkeypatch):
+    """Backfill gives every existing gateway row a unique ``id``,
+    ``subscriber_kind='gateway'``, a JSON ``target`` mirror, and the
+    scope/delivery_policy defaults."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_pre_f01_notify_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM kanban_notify_subs ORDER BY platform"
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        assert all(isinstance(i, int) for i in ids)
+        assert len(set(ids)) == len(ids), "ids must be unique"
+
+        by_platform = {r["platform"]: r for r in rows}
+        tg = by_platform["telegram"]
+        assert tg["subscriber_kind"] == "gateway"
+        assert tg["scope"] == "task"
+        assert tg["delivery_policy"] == "channel"
+        assert json.loads(tg["target"]) == {
+            "platform": "telegram",
+            "chat_id": "123",
+            "thread_id": "th1",
+            "user_id": "u1",
+        }
+        dc = by_platform["discord"]
+        assert json.loads(dc["target"]) == {
+            "platform": "discord",
+            "chat_id": "999",
+            "thread_id": "",
+            "user_id": None,
+        }
+
+
+def test_drifted_legacy_notify_db_backfilled_after_rebuild(tmp_path, monkeypatch):
+    """A drifted (TEXT last_event_id) legacy notify table is rebuilt AND then
+    backfilled: the surviving row gets the new columns populated."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_legacy_db(db_path)  # builds a drifted notify table with one row
+
+    with kb.connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM kanban_notify_subs").fetchone()
+        assert isinstance(row["id"], int)
+        assert row["subscriber_kind"] == "gateway"
+        assert json.loads(row["target"])["platform"] == "telegram"
+        assert json.loads(row["target"])["chat_id"] == "123"
+
+
+def test_fresh_insert_applies_new_column_defaults(tmp_path, monkeypatch):
+    """``add_notify_sub`` on a fresh DB populates id/subscriber_kind/target and
+    the scope/delivery_policy column defaults."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        kb.add_notify_sub(
+            conn, task_id="t1", platform="telegram", chat_id="c1",
+            thread_id="th", user_id="u",
+        )
+        row = conn.execute("SELECT * FROM kanban_notify_subs").fetchone()
+        assert isinstance(row["id"], int)
+        assert row["subscriber_kind"] == "gateway"
+        assert row["scope"] == "task"
+        assert row["delivery_policy"] == "channel"
+        assert json.loads(row["target"]) == {
+            "platform": "telegram",
+            "chat_id": "c1",
+            "thread_id": "th",
+            "user_id": "u",
+        }
+
+        # A second distinct subscription gets a distinct id.
+        kb.add_notify_sub(conn, task_id="t2", platform="telegram", chat_id="c1")
+        ids = [r["id"] for r in conn.execute("SELECT id FROM kanban_notify_subs")]
+        assert len(set(ids)) == 2

@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
-from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
+from hermes_cli.profiles import get_active_profile_name
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +69,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
@@ -314,6 +315,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--project", default=None,
+                          help="Link to a project (id or slug). Anchors the task's "
+                               "worktree under the project's primary repo with a "
+                               "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -330,8 +335,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
-                               "(repeatable). Appended to the built-in "
-                               "kanban-worker skill. Example: "
+                               "(repeatable). The kanban lifecycle is already "
+                               "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
@@ -554,6 +559,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
+    p_block.add_argument(
+        "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
+        help=(
+            "Typed block reason. 'dependency' waits in todo (auto-promoted "
+            "when parents finish, no human); 'needs_input'/'capability' go to "
+            "blocked for a human; 'transient' marks a maybe-flaky failure. "
+            "Repeated same-kind re-blocks after unblock route the task to "
+            "triage to break unblock loops. Omit for a generic block."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -678,17 +693,48 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
-        help="Subscribe a gateway source to a task's terminal events "
-             "(used by /kanban subscribe in the gateway adapter)",
+        help="Subscribe a source to a task's terminal events "
+             "(gateway via --platform/--chat-id, or an explicit "
+             "--subscriber-kind + --target-id)",
     )
     p_nsub.add_argument("task_id")
-    p_nsub.add_argument("--platform", required=True)
-    p_nsub.add_argument("--chat-id", required=True)
+    p_nsub.add_argument(
+        "--subscriber-kind", default="gateway",
+        help="Subscriber surface tag (default: gateway). Use a non-gateway "
+             "kind (e.g. cli) with --target-id to declare an explicit target.",
+    )
+    p_nsub.add_argument(
+        "--target-id", default=None,
+        help="Primary id of a non-gateway target (required when "
+             "--subscriber-kind is not gateway)",
+    )
+    p_nsub.add_argument(
+        "--target", default=None,
+        help="Explicit structured target JSON (advanced; defaults to a tag "
+             "built from --subscriber-kind + --target-id for non-gateway subs)",
+    )
+    # Gateway flags: required only for the default gateway path (validated in
+    # the handler so non-gateway subscriptions can omit them).
+    p_nsub.add_argument("--platform", default=None)
+    p_nsub.add_argument("--chat-id", default=None)
     p_nsub.add_argument("--thread-id", default=None)
     p_nsub.add_argument("--user-id", default=None)
     p_nsub.add_argument(
         "--notifier-profile", default=None,
         help="Profile gateway that owns/delivers this subscription (default: active profile)",
+    )
+    # Additive scope/policy flags. Defaults preserve the gateway/cli/tui
+    # behavior exactly; an orchestrator supervises a subtree with
+    # ``--scope subtree --delivery-policy supervise``.
+    p_nsub.add_argument(
+        "--scope", default="task", choices=["task", "subtree"],
+        help="Subscription scope (default: task). 'subtree' (orchestrator) "
+             "claims the parent's child events.",
+    )
+    p_nsub.add_argument(
+        "--delivery-policy", default="channel", choices=["channel", "supervise"],
+        help="Delivery policy (default: channel). 'supervise' persists a "
+             "structured supervision snapshot for an orchestrator.",
     )
 
     p_nlist = sub.add_parser(
@@ -706,6 +752,53 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--platform", required=True)
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
+
+    p_notices = sub.add_parser(
+        "notices",
+        help="Drain pending non-gateway terminal-event notices (subscriber-kind "
+             "cli/tui). Reading clears them (notice-first display).",
+    )
+    p_notices.add_argument(
+        "--kind", default=None, choices=["cli", "tui"],
+        help="Only drain notices for this subscriber kind (default: all kinds)",
+    )
+    p_notices.add_argument(
+        "--target-id", default=None,
+        help="Only drain notices for this target id (default: all targets)",
+    )
+    p_notices.add_argument("--json", action="store_true")
+
+    # --- supervise: drain orchestrator supervision notices ---
+    p_supervise = sub.add_parser(
+        "supervise",
+        help="Drain pending orchestrator supervision notices for a target "
+             "(subscriber-kind orchestrator). Reading clears them (one-shot).",
+    )
+    p_supervise.add_argument(
+        "--target-id", required=True,
+        help="Orchestrator target id (the --target-id used at notify-subscribe)",
+    )
+    p_supervise.add_argument(
+        "--json", action="store_true",
+        help="Print the structured supervision payload (default: the message line)",
+    )
+
+    # --- reengage: close-the-loop orchestrator re-engagement ---
+    p_reengage = sub.add_parser(
+        "reengage",
+        help="Materialize supervision snapshots into a handoff comment on each root "
+             "(subscriber-kind orchestrator): a fan-in reengage or a blocked "
+             "triage. Drains one-shot.",
+    )
+    p_reengage.add_argument(
+        "--target-id", required=True,
+        help="Orchestrator target id (the --target-id used at notify-subscribe)",
+    )
+    p_reengage.add_argument(
+        "--json", action="store_true",
+        help="Emit a machine-readable list of handed-off roots (root_id + "
+             "comment_id + trigger) instead of the human summary",
+    )
 
     # --- log ---
     p_log = sub.add_parser(
@@ -955,6 +1048,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-subscribe":   _cmd_notify_subscribe,
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
+            "notices":            _cmd_notices,
+            "supervise":          _cmd_supervise,
+            "reengage":           _cmd_reengage,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
@@ -1223,21 +1319,6 @@ def _cmd_init(args: argparse.Namespace) -> int:
     path = kb.init_db()
     print(f"Kanban DB initialized at {path}")
 
-    # Seed bundled skills (e.g. kanban-worker) into the active profile so
-    # the kanban dispatcher can use them without a separate `hermes profile
-    # create` step.  This is best-effort — a missing or broken profile is
-    # not fatal to `kanban init`.
-    try:
-        profile_name = get_active_profile_name() or "default"
-        profile_dir = get_profile_dir(profile_name)
-        result = seed_profile_skills(profile_dir, quiet=True)
-        if result:
-            copied = result.get("copied", [])
-            if copied:
-                print(f"Seeded skill(s) into profile {profile_name}: {', '.join(copied)}")
-    except Exception:
-        pass  # best-effort
-
     print()
     # Enumerate profiles on disk so the user knows what assignees are
     # already addressable. Multica does this auto-detection on its
@@ -1335,6 +1416,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -1461,8 +1543,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
-        # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
-        # ``tasks.result`` is left NULL unless the caller explicitly passed
+        # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
@@ -1938,6 +2019,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
+    kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -1949,12 +2031,26 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 conn,
                 tid,
                 reason=reason,
+                kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
-                print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
+                # Report where the task actually landed — dependency blocks go
+                # to todo, and a tripped unblock-loop breaker routes to triage.
+                landed = kb.get_task(conn, tid)
+                where = landed.status if landed else "blocked"
+                suffix = f": {reason}" if reason else ""
+                if where == "todo":
+                    print(f"{tid} → todo (dependency wait){suffix}")
+                elif where == "triage":
+                    print(
+                        f"{tid} → triage (unblock loop detected — needs a "
+                        f"human decision){suffix}"
+                    )
+                else:
+                    print(f"Blocked {tid}{suffix}")
     return 0 if not failed else 1
 
 
@@ -2417,18 +2513,47 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
+    kind = args.subscriber_kind or "gateway"
+    if kind == "gateway":
+        # Back-compat: the gateway path keys identity off --platform/--chat-id.
+        if not args.platform or not args.chat_id:
+            print("notify-subscribe: --platform and --chat-id are required "
+                  "for gateway subscriptions", file=sys.stderr)
+            return 2
+        platform, chat_id = args.platform, args.chat_id
+        thread_id, target = args.thread_id, args.target
+    else:
+        # Explicit non-gateway subscriber: declare the target
+        # directly instead of inferring it from the calling session. The PK
+        # columns are filled by convention (platform=kind, chat_id=target-id,
+        # thread_id='') so the schema's NOT NULL PK stays satisfied; the real
+        # identity lives in subscriber_kind + the target JSON.
+        if not args.target_id:
+            print(f"notify-subscribe: --target-id is required for "
+                  f"--subscriber-kind {kind}", file=sys.stderr)
+            return 2
+        platform, chat_id, thread_id = kind, args.target_id, ""
+        target = args.target or json.dumps(
+            {"subscriber_kind": kind, "target_id": args.target_id}
+        )
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
         kb.add_notify_sub(
             conn, task_id=args.task_id,
-            platform=args.platform, chat_id=args.chat_id,
-            thread_id=args.thread_id, user_id=args.user_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
+            subscriber_kind=kind, target=target,
+            scope=getattr(args, "scope", None) or "task",
+            delivery_policy=getattr(args, "delivery_policy", None) or "channel",
         )
-    print(f"Subscribed {args.platform}:{args.chat_id}"
-          + (f":{args.thread_id}" if args.thread_id else "")
+    # ``platform`` already holds the right label in both branches — the real
+    # gateway platform (telegram/discord/…) for gateway subs, or the kind for
+    # non-gateway subs — so the gateway confirmation message is unchanged.
+    print(f"Subscribed {platform}:{chat_id}"
+          + (f":{thread_id}" if thread_id else "")
           + f" to {args.task_id}")
     return 0
 
@@ -2445,8 +2570,10 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
     for s in subs:
         thr = f":{s['thread_id']}" if s.get("thread_id") else ""
         owner = f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else ""
-        print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}"
-              f"  (since event {s['last_event_id']}){owner}")
+        kind = s.get("subscriber_kind") or "gateway"
+        tgt = f"  target={s['target']}" if s.get("target") else ""
+        print(f"  {s['task_id']:10s}  [{kind}] {s['platform']}:{s['chat_id']}{thr}"
+              f"  (since event {s['last_event_id']}){owner}{tgt}")
     return 0
 
 
@@ -2461,6 +2588,104 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
         print("(no such subscription)", file=sys.stderr)
         return 1
     print(f"Unsubscribed from {args.task_id}")
+    return 0
+
+
+def _cmd_notices(args: argparse.Namespace) -> int:
+    """Drain pending non-gateway terminal-event notices (CLI/TUI).
+
+    The notifier persists a notice per claimed terminal event for any
+    non-gateway subscription (``subscriber_kind`` cli/tui) into one shared,
+    surface-agnostic store. ``--kind`` / ``--target-id`` scope the drain
+    (default: all). Reading is a one-shot drain so each notice surfaces exactly
+    once.
+    """
+    subscriber_kind = getattr(args, "kind", None)
+    target_id = getattr(args, "target_id", None)
+    with kb.connect_closing() as conn:
+        notices = kb.drain_notices(
+            conn, subscriber_kind=subscriber_kind, target_id=target_id,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(notices, indent=2, ensure_ascii=False))
+        return 0
+    if not notices:
+        print("(no notices)")
+        return 0
+    for n in notices:
+        print(n["message"])
+    return 0
+
+
+def _cmd_supervise(args: argparse.Namespace) -> int:
+    """Drain pending orchestrator supervision notices for a target.
+
+    The orchestrator adapter persists one structured supervision snapshot per
+    delivery into the shared ``kanban_notices`` store, keyed by
+    ``subscriber_kind='orchestrator'`` + target id. Reading is a one-shot drain
+    (claim-once parity with ``kanban notices``). ``--json`` prints the structured
+    ``payload`` snapshot; plain prints the human-readable ``message`` line.
+    """
+    with kb.connect_closing() as conn:
+        notices = kb.drain_notices(
+            conn, subscriber_kind="orchestrator", target_id=args.target_id,
+        )
+    if getattr(args, "json", False):
+        payloads = []
+        for n in notices:
+            raw = n.get("payload")
+            if raw:
+                try:
+                    payloads.append(json.loads(raw))
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            payloads.append({"message": n.get("message")})
+        print(json.dumps(payloads, indent=2, ensure_ascii=False))
+        return 0
+    if not notices:
+        print("(no supervision notices)")
+        return 0
+    for n in notices:
+        print(n["message"])
+    return 0
+
+
+def _cmd_reengage(args: argparse.Namespace) -> int:
+    """Close-the-loop orchestrator re-engagement pass.
+
+    Runs :func:`kanban_db.reengage_orchestrator` for ``--target-id``: drains
+    Drains orchestrator supervision notices (one-shot) and branches per root on its
+    latest drained snapshot — a ``fan_in_ready`` snapshot appends a
+    ``[kanban:reengage]`` comment (judge), a snapshot with a blocked child
+    appends a ``[kanban:triage]`` handoff (answer/unblock/escalate), and a
+    partial with neither produces no comment. ``build_worker_context`` then
+    surfaces the comment to the re-spawned orchestrator turn. ``--json`` emits
+    the machine-readable list of handed-off roots (``root_id``, ``comment_id``,
+    ``trigger``); a second invocation reports nothing (idempotent via the
+    one-shot drain).
+    """
+    with kb.connect_closing() as conn:
+        results = kb.reengage_orchestrator(conn, target_id=args.target_id)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            [
+                {
+                    "root_id": r.root_id,
+                    "comment_id": r.comment_id,
+                    "trigger": r.trigger,
+                }
+                for r in results
+            ],
+            indent=2, ensure_ascii=False,
+        ))
+        return 0
+    if not results:
+        print("(no roots re-engaged)")
+        return 0
+    for r in results:
+        verb = "triaged" if r.trigger == "blocked" else "re-engaged"
+        print(f"{verb} {r.root_id} (comment {r.comment_id})")
     return 0
 
 
